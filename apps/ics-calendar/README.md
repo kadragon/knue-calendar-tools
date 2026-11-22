@@ -28,8 +28,8 @@ A robust Cloudflare Worker that automatically parses the academic calendar from 
 1. **Clone and setup:**
 
    ```bash
-   git clone https://github.com/kadragon/knue-ics-calendar.git
-   cd knue-ics-calendar
+   git clone https://github.com/kadragon/knue-calendar-tools.git
+   cd knue-calendar-tools/apps/ics-calendar
    npm install
    ```
 
@@ -251,8 +251,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 📞 Support
 
-- **Issues**: [GitHub Issues](https://github.com/kadragon/knue-ics-calendar/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/kadragon/knue-ics-calendar/discussions)
+- **Issues and questions**: [GitHub Issues](https://github.com/kadragon/knue-calendar-tools/issues)
 - **Security**: Report vulnerabilities privately via GitHub Security tab
 
 ---

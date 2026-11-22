@@ -2,8 +2,7 @@
 
 Run commands from `apps/event-harvester`. Use Node.js 22 or newer and the Wrangler
 installed by `npm ci`. The staging environment has a separate Worker and Durable
-Object. Both schedules ship disabled so importing state and enabling cron are
-separate operations.
+Object with its schedule disabled. The production Worker runs every 15 minutes.
 
 ## Settings
 
@@ -37,43 +36,42 @@ settings. Initialize the staging state, then set the staging cron expression in
 test calendar, including a bulletin with an image. Restore the staging schedule
 to an empty list when the check is complete.
 
-## Import and production cutover
+## State initialization and production cutover
 
-1. Confirm the currently deployed ICS Worker and its subscription URL. The ICS
-   Worker configuration is carried into this repository unchanged.
-2. Deploy the harvester with the production schedule empty. For the one-time
-   import, temporarily set production `workers_dev` to `true` and set a unique
-   `STATE_IMPORT_TOKEN` secret. The endpoint is accessible only with that token.
-3. Stop the old cron and wait for the last process to finish. Keep a backup of
-   the production SQLite file with any associated WAL files. Export the stopped
-   database using a private output directory:
+Production started with the `bbs28` watermark set to `84558`, the last processed
+ID at cutover. The legacy SQLite records and failure counts were left in the
+legacy database. The bootstrap snapshot was:
 
-   ```sh
-   umask 077
-   mkdir -p data
-   python3 scripts/export-state.py /path/to/production/state.db > data/import.json
-   ```
+```json
+{"version":1,"records":[],"watermarks":[{"feedId":"bbs28","id":84558}],"failures":[]}
+```
 
-4. Compare records, watermarks, and failure counts before import. For an empty
-   staging calendar, the explicit bootstrap snapshot is
-   `{"version":1,"records":[],"watermarks":[],"failures":[]}`.
-5. Write `Authorization: Bearer ...` to a private `data/import.headers` file and
-   submit the snapshot. Use the intended Worker's exact URL in `worker_url`.
-   The endpoint accepts snapshots up to 4 MiB and returns import counts. Repeating
-   the same normalized snapshot is safe.
+For staging or recovery with a new Durable Object, deploy the target environment
+with its cron list temporarily set to `[]`. Enable `workers_dev` temporarily if
+needed and set a unique `STATE_IMPORT_TOKEN` secret. Select the watermark for the
+intended environment. An isolated staging calendar can use empty `records`,
+`watermarks`, and `failures` arrays. For recovery, use the latest confirmed
+watermark and available state.
 
-   ```sh
-   curl --fail-with-body --header @data/import.headers \
-     --header 'Content-Type: application/json' --data-binary @data/import.json \
-     "$worker_url/__migration/state"
-   curl --fail-with-body --header @data/import.headers "$worker_url/__migration/state"
-   ```
+Write `Authorization: Bearer ...` to a private `data/import.headers` file and
+save the snapshot to `data/import.json`. Use the intended Worker's exact URL in
+`worker_url`. The endpoint accepts snapshots up to 4 MiB and returns import
+counts. Repeating the same normalized snapshot is safe.
 
-6. Compare returned counts with the export. Remove the import token, restore
-   production `workers_dev` to `false`, set the production schedule to
-   `["*/15 * * * *"]`, and deploy explicitly with `npm run deploy -- --env ""`.
-   Confirm the actual trigger and first scheduled run in Cloudflare. Compare
-   Calendar and Telegram output and verify the ICS subscription and status route.
+```sh
+curl --fail-with-body --header @data/import.headers \
+  --header 'Content-Type: application/json' --data-binary @data/import.json \
+  "$worker_url/__migration/state"
+curl --fail-with-body --header @data/import.headers "$worker_url/__migration/state"
+```
+
+Compare the returned counts with the snapshot. Remove the import token and
+restore the environment's intended `workers_dev` setting. Before enabling a
+replacement production schedule, stop the previous scheduler and wait for its
+last run to finish. Restore the production cron list to `["*/15 * * * *"]` and
+deploy production explicitly with `npm run deploy -- --env ""`.
+Confirm the actual trigger and first scheduled run in Cloudflare, check Calendar
+and Telegram output, and verify the ICS subscription and status route.
 
 For rollback, disable the new Worker schedule and wait for any current execution.
 Reconcile Calendar events and processed state before restarting the legacy cron.

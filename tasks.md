@@ -17,3 +17,13 @@ AI Gateway Chat Completions and Durable Object key-value state.
 plus executable regression checks.
 
 **Done when:** All local acceptance checks pass and the cutover steps are documented.
+
+## Production follow-up
+
+The production harvester runs every 15 minutes. It started with the `bbs28`
+watermark set to `84558`, with the legacy SQLite records and failure counts left
+in the legacy database. The snapshot importer remains available for staging and
+recovery.
+
+The repository records the deployed attachment User-Agent fix and its regression
+test, the production schedule, and the consolidated ICS support links.
