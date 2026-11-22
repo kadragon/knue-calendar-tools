@@ -1,0 +1,34 @@
+# Node dependencies
+node_modules/
+
+# Build artifacts
+dist/
+.wrangler/
+
+# Local runtime data
+data/
+logs/
+
+# Logs and temp
+npm-debug.log*
+pnpm-debug.log*
+yarn-error.log*
+.DS_Store
+.dev.vars
+
+# Credentials / local env
+.env
+.env.*
+
+# Test output
+coverage/
+.vitest/
+
+# Serena
+.serena/
+
+# Harness runtime artifacts
+tools/.sweep-stamp
+.lock-hash
+.agents/.maintenance-stamp
+.antigravitycli/

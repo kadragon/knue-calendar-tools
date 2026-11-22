@@ -1,0 +1,32 @@
+{
+  "name": "knue-event-harvester",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "test": "vitest --run",
+    "test:coverage": "vitest --run --coverage",
+    "test:coverage:ui": "vitest --run --coverage --reporter=html",
+    "lint": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
+    "prepare": "lefthook install"
+  },
+  "dependencies": {
+    "@xmldom/xmldom": "^0.9.10",
+    "better-sqlite3": "^13.0.1",
+    "dotenv": "^17.4.2"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^26.1.1",
+    "@vitest/coverage-v8": "^4.1.10",
+    "lefthook": "^2.1.10",
+    "tsx": "^4.23.1",
+    "typescript": "^7.0.2",
+    "vite": "^8.1.5",
+    "vitest": "^4.0.16"
+  }
+}
