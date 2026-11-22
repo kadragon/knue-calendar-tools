@@ -16,15 +16,15 @@
     "build:staging": "wrangler deploy --dry-run --env staging"
   },
   "dependencies": {
-    "@xmldom/xmldom": "^0.9.10"
+    "@xmldom/xmldom": "^0.9.12"
   },
   "devDependencies": {
-    "@types/node": "^26.1.1",
+    "@types/node": "^26.6.6",
     "@vitest/coverage-v8": "^4.1.10",
     "esbuild": "0.28.2",
     "miniflare": "5.20261119.0-beta",
     "typescript": "^7.0.2",
-    "vite": "^8.1.5",
+    "vite": "^8.3.8",
     "vitest": "^4.0.16",
     "wrangler": "^4.160.0"
   }
