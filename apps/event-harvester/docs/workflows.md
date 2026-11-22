@@ -39,13 +39,13 @@ Permitted side-effects: write `docs/`, edit `AGENTS.md`.
 3. Add the rule, write a test or hook that enforces it mechanically.
 4. Update `AGENTS.md § Golden Principles` if the principle is new.
 
-Permitted side-effects: edit `.claude/hooks/`, `lefthook.yml`, `.github/workflows/`, `AGENTS.md`.
+Permitted side-effects: edit `.claude/hooks/`, `.github/workflows/`, `AGENTS.md`.
 
 ## `sweep` — Garbage collect the harness
 
 Run manually between features: `bash tools/sweep.sh`
 
-The sweep script checks: lint, test coverage thresholds, doc drift (Wrangler/OPENAI_API_KEY references in README), golden principle violations, harness freshness. See `docs/runbook.md § Sweep`.
+The sweep script checks: lint, test coverage thresholds, Worker-only dependencies, secret logging, harness freshness. See `docs/runbook.md § Sweep`.
 
 ## `explore` — Understand code before acting
 

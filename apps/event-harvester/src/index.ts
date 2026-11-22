@@ -11,13 +11,15 @@ import { sendNotification } from "./lib/telegram.js";
 import { parseRss } from "./lib/rss.js";
 import {
   getProcessedRecord,
-  putProcessedRecord,
+  completeItem,
+  getPendingPlan,
+  listPendingPlans,
+  putPendingPlan,
   getMaxProcessedId,
   updateMaxProcessedId,
   getItemFailureCount,
   recordItemFailure,
   clearItemFailureCount,
-  openDatabase,
   LEGACY_FEED_ID,
   type StateEnv,
 } from "./lib/state.js";
@@ -25,15 +27,15 @@ import { isWithinLastWeek, buildDescription, splitLongEvent } from "./lib/transf
 import type {
   CalendarEventInput,
   FeedSource,
+  GoogleCalendarAttachment,
   ProcessedRecord,
   RssItem,
   PreviewContent,
 } from "./types.js";
 import { buildAttachmentFromFile, getFileType } from "./lib/utils.js";
-import { fileURLToPath } from "node:url";
-import { realpathSync } from "node:fs";
+import { Buffer } from "node:buffer";
 
-interface Env extends StateEnv, CalendarEnv, AiEnv {
+export interface Env extends StateEnv, CalendarEnv, AiEnv {
   SIMILARITY_THRESHOLD?: string;
   LOOKBACK_DAYS?: string;
   TELEGRAM_BOT_TOKEN?: string;
@@ -49,6 +51,21 @@ export const FEEDS: readonly FeedSource[] = [
 ];
 
 const MAX_CONSECUTIVE_ITEM_FAILURES = 3;
+const MAX_HARVEST_MS = 8 * 60_000;
+const MAX_ITEMS_PER_RUN = 20;
+const MAX_PENDING_RETRIES_PER_FEED = 5;
+const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
+
+interface HarvestBudget {
+  remaining: number;
+  deadline: number;
+}
+
+function claimAttempt(budget: HarvestBudget): boolean {
+  if (budget.remaining <= 0 || Date.now() >= budget.deadline) return false;
+  budget.remaining -= 1;
+  return true;
+}
 
 function buildCalendarEventUrl(eventId: string, calendarId: string): string {
   const eidRaw = `${eventId} ${calendarId}`;
@@ -62,30 +79,69 @@ function buildCalendarEventUrl(eventId: string, calendarId: string): string {
 async function fetchRssFeed(url: string): Promise<string> {
   const response = await fetch(url, {
     headers: { "User-Agent": "knue-event-harvester/1.0" },
+    signal: AbortSignal.timeout(15_000),
   });
   if (!response.ok) throw new Error(`RSS fetch failed: ${response.status}`);
   return response.text();
 }
 
+function detectImageType(bytes: Buffer): string | undefined {
+  if (bytes.subarray(0, 8).toString("hex") === "89504e470d0a1a0a") return "image/png";
+  if (bytes.subarray(0, 3).toString("hex") === "ffd8ff") return "image/jpeg";
+  const header = bytes.toString("ascii", 0, 6);
+  if (header === "GIF87a" || header === "GIF89a") return "image/gif";
+  if (bytes.toString("ascii", 0, 4) === "RIFF" && bytes.toString("ascii", 8, 12) === "WEBP") {
+    return "image/webp";
+  }
+  return undefined;
+}
+
 async function fetchImageAsBase64(url: string): Promise<PreviewContent | null> {
-  try {
-    const response = await fetch(url);
-    if (!response.ok) {
-      console.warn(`Image fetch failed (${response.status}): ${url}`);
-      return null;
-    }
-    const contentType = response.headers.get("content-type") ?? "image/jpeg";
-    const buffer = await response.arrayBuffer();
-    const imageBase64 = Buffer.from(buffer).toString("base64");
-    return { sourceType: "image", imageBase64, contentType };
-  } catch (error) {
-    console.warn("Failed to fetch image", url, error);
+  if (!URL.canParse(url)) return null;
+  const source = new URL(url);
+  if (source.protocol !== "https:" || !["www.knue.ac.kr", "knue.ac.kr"].includes(source.hostname)) {
     return null;
   }
+  const response = await fetch(source, {
+    redirect: "manual",
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!response.ok) {
+    await response.body?.cancel();
+    if (response.status === 429 || response.status >= 500) {
+      throw new Error(`Announcement image temporarily unavailable (${response.status})`);
+    }
+    return null;
+  }
+  const contentLength = Number(response.headers.get("content-length") ?? 0);
+  if (contentLength > MAX_IMAGE_BYTES || !response.body) {
+    await response.body?.cancel();
+    return null;
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      length += value.length;
+      if (length > MAX_IMAGE_BYTES) {
+        await reader.cancel();
+        return null;
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = Buffer.concat(chunks, length);
+  const contentType = detectImageType(bytes);
+  return contentType ? { sourceType: "image", imageBase64: bytes.toString("base64"), contentType } : null;
 }
 
 // Stage 1: Enrich item with OCR + AI outputs.
-// I/O: image fetch, Ollama calls. Returns fully described event inputs.
+// I/O: image fetch and AI Gateway calls.
 async function enrichItem(
   env: Env,
   item: RssItem,
@@ -94,7 +150,11 @@ async function enrichItem(
   if (item.attachment?.url && getFileType(item.attachment.filename) === "image") {
     const imageContent = await fetchImageAsBase64(item.attachment.url);
     if (imageContent) {
-      previewText = await extractTextFromImage(env, imageContent);
+      try {
+        previewText = await extractTextFromImage(env, imageContent);
+      } catch {
+        throw new Error("Announcement image extraction failed; retry the post");
+      }
       if (previewText) {
         console.log(`OCR extracted ${previewText.length} chars from image for item ${item.id}`);
       }
@@ -163,6 +223,103 @@ async function validateEventGroup(
   return { kind: "novel", prepared };
 }
 
+interface PendingPlan {
+  events: PreparedEvent[];
+  attachment?: GoogleCalendarAttachment;
+  rssUrl: string;
+  duplicateHash?: string;
+  confirmedEvents?: GoogleCalendarEvent[];
+  lastAttemptedAt?: number;
+}
+
+async function prepareItemPlan(
+  env: Env,
+  feedId: string,
+  item: RssItem,
+  existingEvents: GoogleCalendarEvent[],
+  similarityThreshold: number,
+): Promise<PendingPlan> {
+  const { eventInputs } = await enrichItem(env, item);
+  const plan: PendingPlan = {
+    events: [],
+    attachment: buildAttachmentFromFile(item),
+    rssUrl: item.link,
+  };
+  const seenInputs = new Set<string>();
+  for (const eventInput of eventInputs) {
+    const result = await validateEventGroup(
+      eventInput, existingEvents, feedId, item.id, similarityThreshold,
+    );
+    if (result.kind === "duplicate") {
+      plan.duplicateHash ??= result.skipHash;
+      continue;
+    }
+    for (const event of result.prepared) {
+      const key = JSON.stringify(event.input);
+      if (seenInputs.has(key)) continue;
+      plan.events.push(event);
+      seenInputs.add(key);
+    }
+  }
+  return plan;
+}
+
+async function stableEventId(feedId: string, itemId: string, index: number): Promise<string> {
+  const key = new TextEncoder().encode(JSON.stringify([feedId, itemId, index]));
+  const digest = await crypto.subtle.digest("SHA-256", key);
+  return Buffer.from(digest).toString("hex");
+}
+
+async function executeItemPlan(
+  env: Env,
+  feedId: string,
+  itemId: string,
+  plan: PendingPlan,
+  accessToken: string,
+  existingEvents: GoogleCalendarEvent[],
+  deadline: number,
+): Promise<GoogleCalendarEvent[]> {
+  const createdEvents = plan.confirmedEvents ??= [];
+  if (plan.events.length > 0) {
+    plan.lastAttemptedAt = Date.now();
+    await putPendingPlan(env, feedId, itemId, plan);
+  }
+  for (let index = createdEvents.length; index < plan.events.length; index++) {
+    if (Date.now() >= deadline) throw new Error("Harvest time budget exhausted");
+    const event = plan.events[index];
+    const eventId = await stableEventId(feedId, itemId, index);
+    createdEvents.push(await createEvent(
+      env, accessToken, event.input, event.meta,
+      { summaryHash: event.hash, feedId },
+      plan.attachment ? [plan.attachment] : undefined,
+      eventId,
+    ));
+    await putPendingPlan(env, feedId, itemId, plan);
+  }
+
+  if (Date.now() >= deadline) throw new Error("Harvest time budget exhausted");
+  const last = createdEvents.at(-1);
+  await completeItem(env, feedId, itemId, {
+    eventId: last?.id ?? (plan.duplicateHash ? "duplicate-skip" : ""),
+    nttNo: itemId,
+    processedAt: new Date().toISOString(),
+    hash: plan.events.at(-1)?.hash ?? plan.duplicateHash ?? "",
+    feedId,
+  });
+
+  for (const [index, event] of createdEvents.entries()) {
+    if (!existingEvents.some((known) => known.id === event.id)) existingEvents.push(event);
+    if (Date.now() >= deadline) continue;
+    const eventUrl = event.htmlLink ?? buildCalendarEventUrl(event.id, env.GOOGLE_CALENDAR_ID);
+    await sendNotification({
+      eventTitle: plan.events[index].input.title,
+      rssUrl: plan.rssUrl,
+      eventUrl,
+    }, env);
+  }
+  return createdEvents;
+}
+
 export async function processNewItem(
   env: Env,
   feedId: string,
@@ -170,80 +327,18 @@ export async function processNewItem(
   accessToken: string,
   existingEvents: GoogleCalendarEvent[],
   similarityThreshold: number,
+  deadline = Date.now() + MAX_HARVEST_MS,
 ): Promise<GoogleCalendarEvent[]> {
-  const { eventInputs } = await enrichItem(env, item);
-  const createdEvents: GoogleCalendarEvent[] = [];
-  const attachments = buildAttachmentFromFile(item);
-
-  for (const eventInput of eventInputs) {
-    const result = await validateEventGroup(
-      eventInput, existingEvents, feedId, item.id, similarityThreshold,
-    );
-
-    if (result.kind === "duplicate") {
-      await putProcessedRecord(env, feedId, item.id, {
-        eventId: "duplicate-skip",
-        nttNo: item.id,
-        processedAt: new Date().toISOString(),
-        hash: result.skipHash,
-        feedId,
-      });
-      continue;
-    }
-
-    // Create all events in the group (none are duplicates)
-    const newlyCreated: GoogleCalendarEvent[] = [];
-    for (const prepared of result.prepared) {
-      const created = await createEvent(
-        env, accessToken, prepared.input, prepared.meta,
-        { summaryHash: prepared.hash, feedId },
-        attachments ? [attachments] : undefined,
-      );
-      newlyCreated.push(created);
-    }
-
-    // Commit state and notify after all events in group are created
-    for (let i = 0; i < newlyCreated.length; i++) {
-      const created = newlyCreated[i];
-      const prepared = result.prepared[i];
-      await putProcessedRecord(env, feedId, item.id, {
-        ...prepared.meta,
-        eventId: created.id,
-      });
-      existingEvents.push(created);
-      createdEvents.push(created);
-      const calendarUrl = created.htmlLink ?? buildCalendarEventUrl(created.id, env.GOOGLE_CALENDAR_ID);
-      await sendNotification(
-        { eventTitle: prepared.input.title, rssUrl: item.link, eventUrl: calendarUrl },
-        env,
-      );
-    }
-  }
-
-  // Trace: AC-7 — reaching here means the AI answered with an empty event list.
-  // A failed AI call throws instead (AiResponseParseError or a transport error), so no
-  // processed record is written for the item. runFeed caps the feed watermark below the
-  // lowest failed id, so the item is picked up again on the next run.
-  if (eventInputs.length === 0) {
-    console.log(
-      `AI returned no events for item ${item.id} (feed=${feedId}), marking as processed`,
-    );
-    await putProcessedRecord(env, feedId, item.id, {
-      eventId: "",
-      nttNo: item.id,
-      processedAt: new Date().toISOString(),
-      hash: "",
-      feedId,
-    });
-  }
-
-  return createdEvents;
+  const plan = await getPendingPlan<PendingPlan>(env, feedId, item.id)
+    ?? await prepareItemPlan(env, feedId, item, existingEvents, similarityThreshold);
+  return executeItemPlan(env, feedId, item.id, plan, accessToken, existingEvents, deadline);
 }
 
 export async function run(
   env: Env,
   feeds: readonly FeedSource[] = FEEDS,
 ): Promise<{ processed: number; created: number }> {
+  const budget = { remaining: MAX_ITEMS_PER_RUN, deadline: Date.now() + MAX_HARVEST_MS };
   const accessToken = await obtainAccessToken(env);
   const lookbackDays = Number.parseInt(env.LOOKBACK_DAYS ?? "60", 10);
   const now = new Date();
@@ -262,7 +357,7 @@ export async function run(
 
   for (const feed of feeds) {
     try {
-      const stats = await runFeed(env, feed, accessToken, existing, similarityThreshold);
+      const stats = await runFeed(env, feed, accessToken, existing, similarityThreshold, budget);
       totalProcessed += stats.processed;
       totalCreated += stats.created;
     } catch (error) {
@@ -279,19 +374,42 @@ async function runFeed(
   accessToken: string,
   existing: GoogleCalendarEvent[],
   similarityThreshold: number,
+  budget: HarvestBudget,
 ): Promise<{ processed: number; created: number }> {
-  const rssXml = await fetchRssFeed(feed.url);
-  const items = parseRss(rssXml);
-  const maxProcessedId = await getMaxProcessedId(env, feed.id);
-
   let processed = 0;
   let created = 0;
   const skippedItems: string[] = [];
   const alreadyProcessedItems: string[] = [];
   let maxAdvancableId = 0;
   let minFailedId = Number.POSITIVE_INFINITY;
+  let deferred = false;
+  const pending = new Set<string>();
 
+  const plans = await listPendingPlans<PendingPlan>(env, feed.id);
+  plans.sort((a, b) => (a.plan.lastAttemptedAt ?? 0) - (b.plan.lastAttemptedAt ?? 0));
+  for (const [index, { nttNo, plan }] of plans.entries()) {
+    pending.add(nttNo);
+    const itemId = Number.parseInt(nttNo, 10);
+    if (index >= MAX_PENDING_RETRIES_PER_FEED || !claimAttempt(budget)) {
+      if (Number.isFinite(itemId)) minFailedId = Math.min(minFailedId, itemId);
+      continue;
+    }
+    try {
+      const result = await executeItemPlan(env, feed.id, nttNo, plan, accessToken, existing, budget.deadline);
+      processed += 1;
+      created += result.length;
+      if (Number.isFinite(itemId)) maxAdvancableId = Math.max(maxAdvancableId, itemId);
+    } catch (error) {
+      console.error(`Failed to resume item ${nttNo} (feed=${feed.id})`, error);
+      if (Number.isFinite(itemId)) minFailedId = Math.min(minFailedId, itemId);
+    }
+  }
+
+  const rssXml = await fetchRssFeed(feed.url);
+  const items = parseRss(rssXml);
+  const maxProcessedId = await getMaxProcessedId(env, feed.id);
   for (const item of items) {
+    if (pending.has(item.id)) continue;
     const itemId = Number.parseInt(item.id, 10);
     if (!Number.isNaN(itemId) && itemId <= maxProcessedId) {
       // Trace: AC-1 — an early-exit item must not retain a stale failure streak.
@@ -336,12 +454,15 @@ async function runFeed(
       continue;
     }
 
+    if (!claimAttempt(budget)) {
+      deferred = true;
+      break;
+    }
+
     try {
       const results = await processNewItem(
-        env, feed.id, item, accessToken, existing, similarityThreshold,
+        env, feed.id, item, accessToken, existing, similarityThreshold, budget.deadline,
       );
-      // Trace: AC-1 — successful processing starts a fresh failure streak.
-      await clearItemFailureCount(env, feed.id, item.id);
       processed += 1;
       created += results.length;
       if (!Number.isNaN(itemId) && itemId > maxAdvancableId) {
@@ -350,7 +471,7 @@ async function runFeed(
     } catch (error) {
       // Separate the two abort causes in the logs: a parse failure means the model
       // answered and we could not use it, which points at the prompt or schema rather
-      // than at Ollama being down.
+      // than at the gateway being down.
       const cause = error instanceof AiResponseParseError ? "unusable AI response" : "error";
       console.error(`Failed to process item ${item.id} (feed=${feed.id}) — ${cause}`, error);
       if (error instanceof AiResponseParseError) {
@@ -382,7 +503,7 @@ async function runFeed(
       `[${feed.id}] Watermark held at ${watermark} instead of ${maxAdvancableId} by failed item ${minFailedId} — it will be retried next run`,
     );
   }
-  if (watermark > 0) {
+  if (!deferred && watermark > 0) {
     await updateMaxProcessedId(env, feed.id, watermark.toString());
   }
 
@@ -399,54 +520,4 @@ async function runFeed(
   }
 
   return { processed, created };
-}
-
-async function main() {
-  const { config } = await import("dotenv");
-  config();
-
-  const dbPath = process.env.DATABASE_PATH ?? (() => {
-    const defaultPath = new URL("../data/state.db", import.meta.url).pathname;
-    console.warn(`DATABASE_PATH not set, using default: ${defaultPath}`);
-    return defaultPath;
-  })();
-  const db = openDatabase(dbPath);
-
-  const env: Env = {
-    db,
-    OLLAMA_HOST: process.env.OLLAMA_HOST ?? "http://127.0.0.1:11434",
-    OLLAMA_CONTENT_MODEL: process.env.OLLAMA_CONTENT_MODEL ?? "llama3.1:8b",
-    OLLAMA_VISION_MODEL: process.env.OLLAMA_VISION_MODEL,
-    GOOGLE_CALENDAR_ID: process.env.GOOGLE_CALENDAR_ID ?? "",
-    GOOGLE_SERVICE_ACCOUNT_JSON: process.env.GOOGLE_SERVICE_ACCOUNT_JSON ?? "",
-    SIMILARITY_THRESHOLD: process.env.SIMILARITY_THRESHOLD,
-    LOOKBACK_DAYS: process.env.LOOKBACK_DAYS,
-    TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
-    TELEGRAM_USER_ID: process.env.TELEGRAM_USER_ID,
-  };
-
-  try {
-    const stats = await run(env);
-    console.log("Run complete", stats);
-  } finally {
-    db.close();
-  }
-}
-
-const isMain = (() => {
-  if (!process.argv[1]) return false;
-  try {
-    return fileURLToPath(import.meta.url) === realpathSync(process.argv[1]);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
-    console.warn("isMain: unexpected error resolving argv[1]:", err);
-    return false;
-  }
-})();
-
-if (isMain) {
-  main().catch((err) => {
-    console.error("Fatal error:", err);
-    process.exit(1);
-  });
 }

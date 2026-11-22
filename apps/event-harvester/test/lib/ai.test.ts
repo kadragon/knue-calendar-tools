@@ -6,15 +6,20 @@ import type { PreviewContent, RssItem } from '../../src/types.js';
 const fetchMock = vi.fn();
 global.fetch = fetchMock;
 
-// Ollama response format: { message: { content: "..." } }
-function ollamaOk(content: unknown) {
+function gatewayReply(content: string, finishReason = 'stop') {
   return {
     ok: true,
-    json: () => Promise.resolve({ message: { content: JSON.stringify(content) } }),
+    json: () => Promise.resolve({
+      choices: [{ finish_reason: finishReason, message: { content } }],
+    }),
   };
 }
 
-function ollamaError(status = 500, body = 'Internal Server Error') {
+function gatewayOk(content: unknown) {
+  return gatewayReply(JSON.stringify(content));
+}
+
+function gatewayError(status = 500, body = 'Internal Server Error') {
   return {
     ok: false,
     status,
@@ -27,9 +32,9 @@ describe('AI Module', () => {
 
   beforeEach(() => {
     mockEnv = {
-      OLLAMA_HOST: 'http://127.0.0.1:11434',
-      OLLAMA_CONTENT_MODEL: 'llama3.1:8b',
-      OLLAMA_VISION_MODEL: 'llama3.2-vision',
+      AI_GATEWAY_URL: 'https://gateway.ai.cloudflare.com/v1/account/gateway/openai/chat/completions',
+      AI_GATEWAY_TOKEN: 'gateway-token',
+      OPENAI_MODEL: 'test-image-model',
     };
     vi.clearAllMocks();
     fetchMock.mockReset();
@@ -41,7 +46,7 @@ describe('AI Module', () => {
 
   describe('generateSummary', () => {
     it('should generate summary successfully', async () => {
-      fetchMock.mockResolvedValueOnce(ollamaOk({
+      fetchMock.mockResolvedValueOnce(gatewayOk({
         summary: '공지사항 요약',
         highlights: ['중요 포인트 1', '중요 포인트 2'],
         actionItems: ['행동 항목 1'],
@@ -66,15 +71,21 @@ describe('AI Module', () => {
 
       expect(fetchMock).toHaveBeenCalledTimes(1);
       const [url, init] = fetchMock.mock.calls[0];
-      expect(url).toBe('http://127.0.0.1:11434/api/chat');
+      expect(url).toBe(mockEnv.AI_GATEWAY_URL);
+      expect(init.headers['cf-aig-authorization']).toBe('Bearer gateway-token');
+      expect(init.headers).not.toHaveProperty('Authorization');
+      expect(init.signal).toBeInstanceOf(AbortSignal);
       const body = JSON.parse(init.body);
-      expect(body.model).toBe('llama3.1:8b');
+      expect(body.model).toBe(mockEnv.OPENAI_MODEL);
       expect(body.stream).toBe(false);
-      expect(body.format).toBeDefined();
+      expect(body.response_format).toMatchObject({
+        type: 'json_schema',
+        json_schema: { strict: true, schema: { type: 'object' } },
+      });
     });
 
-    it('should return fallback on Ollama error', async () => {
-      fetchMock.mockResolvedValueOnce(ollamaError());
+    it('should return fallback on AI Gateway error', async () => {
+      fetchMock.mockResolvedValueOnce(gatewayError());
 
       const result = await generateSummary(mockEnv, {
         title: '테스트',
@@ -92,10 +103,7 @@ describe('AI Module', () => {
     });
 
     it('should handle malformed JSON response', async () => {
-      fetchMock.mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ message: { content: 'invalid json' } }),
-      });
+      fetchMock.mockResolvedValueOnce(gatewayReply('invalid json'));
 
       const result = await generateSummary(mockEnv, {
         title: '테스트',
@@ -113,7 +121,7 @@ describe('AI Module', () => {
     });
 
     it('should handle partial JSON response', async () => {
-      fetchMock.mockResolvedValueOnce(ollamaOk({
+      fetchMock.mockResolvedValueOnce(gatewayOk({
         summary: '요약',
         highlights: 'not an array', // Invalid type
         actionItems: ['valid item'],
@@ -137,7 +145,7 @@ describe('AI Module', () => {
 
   describe('extractTextFromImage', () => {
     it('should extract text from image successfully', async () => {
-      fetchMock.mockResolvedValueOnce(ollamaOk({ extractedText: '추출된 텍스트' }));
+      fetchMock.mockResolvedValueOnce(gatewayOk({ extractedText: '추출된 텍스트' }));
 
       const preview: PreviewContent = {
         sourceType: 'image',
@@ -151,36 +159,28 @@ describe('AI Module', () => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
 
       const [url, init] = fetchMock.mock.calls[0];
-      expect(url).toBe('http://127.0.0.1:11434/api/chat');
+      expect(url).toBe(mockEnv.AI_GATEWAY_URL);
+      expect(init.headers['cf-aig-authorization']).toBe('Bearer gateway-token');
+      expect(init.headers).not.toHaveProperty('Authorization');
+      expect(init.signal).toBeInstanceOf(AbortSignal);
       const body = JSON.parse(init.body);
-      expect(body.model).toBe('llama3.2-vision');
-      // Ollama native vision format: images[] on the user message
+      expect(body.model).toBe(mockEnv.OPENAI_MODEL);
       const userMessage = body.messages[1];
-      expect(userMessage.images).toContain('base64-image-data');
-      expect(typeof userMessage.content).toBe('string');
+      expect(userMessage.content).toContainEqual({
+        type: 'image_url',
+        image_url: { url: 'data:image/png;base64,base64-image-data' },
+      });
     });
 
-    it('should fall back to OLLAMA_CONTENT_MODEL when OLLAMA_VISION_MODEL is not set', async () => {
-      const envWithoutVision: AiEnv = {
-        OLLAMA_HOST: 'http://127.0.0.1:11434',
-        OLLAMA_CONTENT_MODEL: 'llama3.1:8b',
-        // No OLLAMA_VISION_MODEL — should fall back to content model
-      };
-
-      fetchMock.mockResolvedValueOnce(ollamaOk({ extractedText: 'fallback text' }));
-
+    it('should avoid sending an unsupported image type to AI Gateway', async () => {
       const preview: PreviewContent = {
         sourceType: 'image',
         imageBase64: 'data',
+        contentType: 'image/svg+xml',
       };
 
-      const result = await extractTextFromImage(envWithoutVision, preview);
-
-      expect(result).toBe('fallback text');
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-      const [, init] = fetchMock.mock.calls[0];
-      const body = JSON.parse(init.body);
-      expect(body.model).toBe('llama3.1:8b'); // Falls back to content model
+      expect(await extractTextFromImage(mockEnv, preview)).toBeUndefined();
+      expect(fetchMock).not.toHaveBeenCalled();
     });
 
     it('should return undefined for non-image content', async () => {
@@ -204,43 +204,37 @@ describe('AI Module', () => {
       expect(fetchMock).not.toHaveBeenCalled();
     });
 
-    it('should return undefined on Ollama error', async () => {
-      fetchMock.mockResolvedValueOnce(ollamaError(429, 'Rate limited'));
+    it('rejects on AI Gateway error so the caller can retry the image', async () => {
+      fetchMock.mockResolvedValueOnce(gatewayError(429, 'Rate limited'));
 
       const preview: PreviewContent = {
         sourceType: 'image',
         imageBase64: 'data',
       };
 
-      const result = await extractTextFromImage(mockEnv, preview);
-      expect(result).toBeUndefined();
+      await expect(extractTextFromImage(mockEnv, preview)).rejects.toThrow('AI Gateway request failed (429)');
     });
 
     it('should handle malformed OCR JSON response', async () => {
-      fetchMock.mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ message: { content: 'not json' } }),
-      });
+      fetchMock.mockResolvedValueOnce(gatewayReply('not json'));
 
       const preview: PreviewContent = {
         sourceType: 'image',
         imageBase64: 'data',
       };
 
-      const result = await extractTextFromImage(mockEnv, preview);
-      expect(result).toBeUndefined();
+      await expect(extractTextFromImage(mockEnv, preview)).rejects.toThrow(SyntaxError);
     });
 
     it('should handle OCR response without extractedText', async () => {
-      fetchMock.mockResolvedValueOnce(ollamaOk({ otherField: 'value' }));
+      fetchMock.mockResolvedValueOnce(gatewayOk({ otherField: 'value' }));
 
       const preview: PreviewContent = {
         sourceType: 'image',
         imageBase64: 'data',
       };
 
-      const result = await extractTextFromImage(mockEnv, preview);
-      expect(result).toBeUndefined();
+      await expect(extractTextFromImage(mockEnv, preview)).rejects.toThrow('AI Gateway returned no image extraction');
     });
   });
 
@@ -258,7 +252,7 @@ describe('AI Module', () => {
     });
 
     it('should generate event infos with single event', async () => {
-      fetchMock.mockResolvedValueOnce(ollamaOk({
+      fetchMock.mockResolvedValueOnce(gatewayOk({
         events: [
           {
             title: '수강신청',
@@ -285,7 +279,7 @@ describe('AI Module', () => {
     });
 
     it('should generate event infos with multiple events', async () => {
-      fetchMock.mockResolvedValueOnce(ollamaOk({
+      fetchMock.mockResolvedValueOnce(gatewayOk({
         events: [
           {
             title: '행사 1',
@@ -314,7 +308,7 @@ describe('AI Module', () => {
     });
 
     it('should use pubDate as fallback when startDate not provided', async () => {
-      fetchMock.mockResolvedValueOnce(ollamaOk({
+      fetchMock.mockResolvedValueOnce(gatewayOk({
         events: [{ title: '행사', description: '설명' }],
       }));
 
@@ -324,25 +318,22 @@ describe('AI Module', () => {
       expect(result[0].endDate).toBe(mockItem.pubDate);
     });
 
-    it('should throw on Ollama error', async () => {
-      fetchMock.mockResolvedValueOnce(ollamaError());
+    it('should throw on AI Gateway error', async () => {
+      fetchMock.mockResolvedValueOnce(gatewayError());
 
-      await expect(generateEventInfos(mockEnv, mockItem)).rejects.toThrow('Ollama request failed');
+      await expect(generateEventInfos(mockEnv, mockItem)).rejects.toThrow('AI Gateway request failed');
     });
 
     // Trace: AC-1 — a malformed response is a failure, not "no events"
     it('should throw AiResponseParseError on malformed JSON response', async () => {
-      fetchMock.mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ message: { content: 'invalid json' } }),
-      });
+      fetchMock.mockResolvedValueOnce(gatewayReply('invalid json'));
 
       await expect(generateEventInfos(mockEnv, mockItem)).rejects.toThrow(AiResponseParseError);
     });
 
     // Trace: AC-2 — schema violation is a failure, not "no events"
     it('should throw AiResponseParseError when events array is missing from response', async () => {
-      fetchMock.mockResolvedValueOnce(ollamaOk({
+      fetchMock.mockResolvedValueOnce(gatewayOk({
         title: '단일 행사',
         description: '배열이 아닌 단일 객체',
       }));
@@ -350,12 +341,9 @@ describe('AI Module', () => {
       await expect(generateEventInfos(mockEnv, mockItem)).rejects.toThrow(AiResponseParseError);
     });
 
-    // Trace: AC-3 — empty content means Ollama gave us nothing to parse
-    it('should throw AiResponseParseError when Ollama returns empty content', async () => {
-      fetchMock.mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ message: { content: '' } }),
-      });
+    // Trace: AC-3 — empty content means the model gave us nothing to parse
+    it('should throw AiResponseParseError when the model returns empty content', async () => {
+      fetchMock.mockResolvedValueOnce(gatewayReply(''));
 
       await expect(generateEventInfos(mockEnv, mockItem)).rejects.toThrow(AiResponseParseError);
     });
@@ -363,7 +351,7 @@ describe('AI Module', () => {
     // Trace: AC-3 — the model answered with events, but none survived validation.
     // Dropping them all is a failed extraction, not a "no events" answer.
     it('should throw AiResponseParseError when every returned event is unusable', async () => {
-      fetchMock.mockResolvedValueOnce(ollamaOk({
+      fetchMock.mockResolvedValueOnce(gatewayOk({
         events: [{ title: '', description: '', startDate: '2025-11-01', endDate: '2025-11-01' }],
       }));
 
@@ -371,24 +359,44 @@ describe('AI Module', () => {
     });
 
     // Trace: AC-4 — the one genuine "no events" case must still resolve, not throw
+    it('should retry an incomplete upstream response even when it contains an empty events array', async () => {
+      fetchMock.mockResolvedValueOnce(gatewayReply('{"events":[]}', 'length'));
+
+      await expect(generateEventInfos(mockEnv, mockItem)).rejects.toThrow('incomplete');
+    });
+
+    it('should reject invalid calendar dates before writing events', async () => {
+      fetchMock.mockResolvedValueOnce(gatewayOk({
+        events: [{ title: '행사', description: '설명', startDate: '2025-11-31', endDate: '2025-11-31' }],
+      }));
+
+      await expect(generateEventInfos(mockEnv, mockItem)).rejects.toThrow(AiResponseParseError);
+    });
+
     it('should return empty array when AI returns empty events array', async () => {
-      fetchMock.mockResolvedValueOnce(ollamaOk({ events: [] }));
+      fetchMock.mockResolvedValueOnce(gatewayOk({ events: [] }));
 
       const result = await generateEventInfos(mockEnv, mockItem);
       expect(result).toHaveLength(0);
     });
 
-    it('should call Ollama /api/chat with correct structure', async () => {
-      fetchMock.mockResolvedValueOnce(ollamaOk({ events: [{ title: 'test', description: 'test' }] }));
+    it('should call the AI Gateway with the event schema and prompt', async () => {
+      fetchMock.mockResolvedValueOnce(gatewayOk({ events: [{ title: 'test', description: 'test' }] }));
 
       await generateEventInfos(mockEnv, mockItem);
 
       const [url, init] = fetchMock.mock.calls[0];
-      expect(url).toBe('http://127.0.0.1:11434/api/chat');
+      expect(url).toBe(mockEnv.AI_GATEWAY_URL);
+      expect(init.headers['cf-aig-authorization']).toBe('Bearer gateway-token');
+      expect(init.headers).not.toHaveProperty('Authorization');
+      expect(init.signal).toBeInstanceOf(AbortSignal);
       const body = JSON.parse(init.body);
-      expect(body.model).toBe(mockEnv.OLLAMA_CONTENT_MODEL);
+      expect(body.model).toBe(mockEnv.OPENAI_MODEL);
       expect(body.stream).toBe(false);
-      expect(body.format).toBeDefined();
+      expect(body.response_format).toMatchObject({
+        type: 'json_schema',
+        json_schema: { strict: true, schema: { type: 'object' } },
+      });
       expect(body.messages[1].content).toContain(mockItem.title);
       expect(body.messages[1].content).toContain(mockItem.pubDate);
     });
@@ -401,7 +409,7 @@ describe('AI Module', () => {
           descriptionHtml: '<p>Use &amp;lt;br&amp;gt; for breaks</p>',
         };
 
-        fetchMock.mockResolvedValueOnce(ollamaOk({ events: [{ title: 'test', description: 'test' }] }));
+        fetchMock.mockResolvedValueOnce(gatewayOk({ events: [{ title: 'test', description: 'test' }] }));
 
         await generateEventInfos(mockEnv, itemWithDoubleEncoded);
 
@@ -419,7 +427,7 @@ describe('AI Module', () => {
           descriptionHtml: '<p>Date: 2025-01-01 &amp; Time: 09:00</p>',
         };
 
-        fetchMock.mockResolvedValueOnce(ollamaOk({ events: [{ title: 'test', description: 'test' }] }));
+        fetchMock.mockResolvedValueOnce(gatewayOk({ events: [{ title: 'test', description: 'test' }] }));
 
         await generateEventInfos(mockEnv, itemWithSingleEncoded);
 
@@ -434,7 +442,7 @@ describe('AI Module', () => {
           descriptionHtml: '<p>&lt;script&gt; and &amp;amp; and &amp;lt;tag&amp;gt;</p>',
         };
 
-        fetchMock.mockResolvedValueOnce(ollamaOk({ events: [{ title: 'test', description: 'test' }] }));
+        fetchMock.mockResolvedValueOnce(gatewayOk({ events: [{ title: 'test', description: 'test' }] }));
 
         await generateEventInfos(mockEnv, itemWithMixed);
 
@@ -453,7 +461,7 @@ describe('AI Module', () => {
           descriptionHtml: '<p>Café &#233; and &#x3A9; Omega</p>',
         };
 
-        fetchMock.mockResolvedValueOnce(ollamaOk({ events: [{ title: 'test', description: 'test' }] }));
+        fetchMock.mockResolvedValueOnce(gatewayOk({ events: [{ title: 'test', description: 'test' }] }));
 
         await generateEventInfos(mockEnv, itemWithNumeric);
 

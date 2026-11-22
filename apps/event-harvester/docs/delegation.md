@@ -9,7 +9,7 @@ Delegation is a golden principle. Skipping a mandatory gate is a violation. All 
 | First edit in `src/` or `test/` this session | `Explore` subagent | sonnet | Mandatory, blocking |
 | Change touches `src/lib/state.ts` (schema/persistence) | `feature-dev:code-explorer` | sonnet | Mandatory, blocking |
 | Change touches `src/lib/calendar.ts` (JWT/OAuth) | `feature-dev:code-explorer` | sonnet | Mandatory, blocking |
-| Change touches `run.sh` or `.github/workflows/` | `Explore` subagent | sonnet | Mandatory, blocking |
+| Change touches `wrangler.jsonc` or a workflow | `Explore` subagent | sonnet | Mandatory, blocking |
 | Change touches ≥3 files across `src/` | `Plan` subagent | sonnet | Mandatory before edits |
 | Post-implementation (always) | `feature-dev:code-reviewer` | sonnet | Mandatory, blocking |
 | Same failure 2× | `codex:rescue` | opus | Escalation, blocking |

@@ -11,10 +11,9 @@
     "forceConsistentCasingInFileNames": true,
     "types": [
       "@types/node",
-      "@types/better-sqlite3",
       "vitest/globals"
     ]
   },
-  "include": ["src"],
+  "include": ["src", "worker-configuration.d.ts"],
   "exclude": ["node_modules", "dist"]
 }

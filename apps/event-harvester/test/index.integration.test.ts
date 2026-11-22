@@ -1,6 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import Database from 'better-sqlite3';
-import { run } from '../src/index.js';
+import { processNewItem, run } from '../src/index.js';
 import type { FeedSource, RssItem } from '../src/types.js';
 
 vi.mock('../src/lib/rss.js', () => ({
@@ -29,13 +28,15 @@ vi.mock('../src/lib/dedupe.js', () => ({
 
 vi.mock('../src/lib/state.js', () => ({
   getProcessedRecord: vi.fn(),
-  putProcessedRecord: vi.fn(),
+  completeItem: vi.fn(),
+  getPendingPlan: vi.fn(),
+  listPendingPlans: vi.fn(),
+  putPendingPlan: vi.fn(),
   getMaxProcessedId: vi.fn(),
   updateMaxProcessedId: vi.fn(),
   getItemFailureCount: vi.fn(),
   recordItemFailure: vi.fn(),
   clearItemFailureCount: vi.fn(),
-  openDatabase: vi.fn(),
   LEGACY_FEED_ID: 'bbs28',
 }));
 
@@ -49,12 +50,16 @@ import { obtainAccessToken, listEvents, createEvent } from '../src/lib/calendar.
 import {
   getMaxProcessedId,
   getProcessedRecord,
-  putProcessedRecord,
+  completeItem,
+  getPendingPlan,
+  listPendingPlans,
+  putPendingPlan,
   updateMaxProcessedId,
   getItemFailureCount,
   recordItemFailure,
   clearItemFailureCount,
 } from '../src/lib/state.js';
+import { sendNotification } from '../src/lib/telegram.js';
 import { isDuplicate, computeHash } from '../src/lib/dedupe.js';
 
 const NOTICE_FEED: FeedSource = {
@@ -71,28 +76,27 @@ const CHEONGNAM_FEED: FeedSource = {
 
 describe('Integration Tests', () => {
   let mockEnv: any;
-  let db: Database.Database;
 
   beforeEach(() => {
-    db = new Database(':memory:');
-    db.pragma('journal_mode = WAL');
     mockEnv = {
-      db,
       GOOGLE_SERVICE_ACCOUNT_JSON: '{}',
       GOOGLE_CALENDAR_ID: 'test-calendar',
-      OLLAMA_HOST: 'http://127.0.0.1:11434',
-      OLLAMA_CONTENT_MODEL: 'llama3.1:8b',
+      AI_GATEWAY_URL: 'https://gateway.ai.cloudflare.com/v1/test/gateway/openai/chat/completions',
+      AI_GATEWAY_TOKEN: 'test',
+      OPENAI_MODEL: 'model',
       SIMILARITY_THRESHOLD: '0.85',
       LOOKBACK_DAYS: '60',
     };
 
-    vi.clearAllMocks();
+    vi.resetAllMocks();
     global.fetch = vi.fn();
     (obtainAccessToken as ReturnType<typeof vi.fn>).mockResolvedValue('test-token');
     (listEvents as ReturnType<typeof vi.fn>).mockResolvedValue([]);
     (getMaxProcessedId as ReturnType<typeof vi.fn>).mockResolvedValue(0);
     (getProcessedRecord as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-    (putProcessedRecord as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+    vi.mocked(getPendingPlan).mockResolvedValue(null);
+    vi.mocked(listPendingPlans).mockResolvedValue([]);
+    (completeItem as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
     (getItemFailureCount as ReturnType<typeof vi.fn>).mockResolvedValue(0);
     (recordItemFailure as ReturnType<typeof vi.fn>).mockResolvedValue(1);
     (clearItemFailureCount as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
@@ -101,8 +105,119 @@ describe('Integration Tests', () => {
   });
 
   afterEach(() => {
-    db.close();
+    vi.useRealTimers();
     vi.restoreAllMocks();
+  });
+
+  it('resumes a saved multi-event plan after a partial Google Calendar write', async () => {
+    const item: RssItem = {
+      id: '70', title: '행사', link: 'https://www.knue.ac.kr/notice/70',
+      pubDate: '2026-04-16', descriptionHtml: '<p>행사 두 건</p>',
+    };
+    const event = { description: '', startDate: '2026-04-23', endDate: '2026-04-23' };
+    vi.mocked(generateSummary).mockResolvedValue({
+      summary: '요약', highlights: [], actionItems: [], links: [],
+    });
+    vi.mocked(generateEventInfos).mockResolvedValue([
+      { ...event, title: '오전 행사' }, { ...event, title: '오후 행사' },
+    ]);
+    let savedPlan: unknown;
+    vi.mocked(putPendingPlan).mockImplementation(async (_env, _feed, _id, plan) => {
+      savedPlan = plan;
+    });
+    vi.mocked(getPendingPlan).mockImplementation(async () => savedPlan ?? null);
+    const remoteIds = new Set<string>();
+    let attempts = 0;
+    vi.mocked(createEvent).mockImplementation(async (...args) => {
+      const stableId = args[6]!;
+      if (++attempts === 2) throw new Error('calendar timeout');
+      const recovered = remoteIds.has(stableId);
+      remoteIds.add(stableId);
+      return { id: stableId, ...(recovered ? { recovered: true as const } : {}) };
+    });
+
+    await expect(processNewItem(mockEnv, NOTICE_FEED.id, item, 'token', [], 0.85))
+      .rejects.toThrow('calendar timeout');
+    expect(savedPlan).toBeDefined();
+    expect(completeItem).not.toHaveBeenCalled();
+    await processNewItem(mockEnv, NOTICE_FEED.id, item, 'token', [], 0.85);
+    expect(generateEventInfos).toHaveBeenCalledTimes(1);
+    expect(remoteIds.size).toBe(2);
+    expect(completeItem).toHaveBeenCalledTimes(1);
+  });
+
+  it('defers completion and notifications if the final insert crosses the run deadline', async () => {
+    vi.useFakeTimers();
+    const deadline = Date.now() + 1000;
+    const item: RssItem = {
+      id: '70', title: '행사', link: 'https://www.knue.ac.kr/notice/70',
+      pubDate: '2026-04-16', descriptionHtml: '행사 한 건',
+    };
+    vi.mocked(generateSummary).mockResolvedValue({
+      summary: '요약', highlights: [], actionItems: [], links: [],
+    });
+    vi.mocked(generateEventInfos).mockResolvedValue([{
+      title: '행사', description: '', startDate: '2026-04-23', endDate: '2026-04-23',
+    }]);
+    let saved: unknown;
+    vi.mocked(putPendingPlan).mockImplementation(async (_env, _feed, _id, plan) => {
+      saved = structuredClone(plan);
+    });
+    vi.mocked(getPendingPlan).mockImplementation(async () => saved ?? null);
+    vi.mocked(createEvent).mockImplementation(async () => {
+      vi.setSystemTime(deadline);
+      return { id: 'existing' };
+    });
+
+    await expect(processNewItem(mockEnv, NOTICE_FEED.id, item, 'token', [], 0.85, deadline))
+      .rejects.toThrow('Harvest time budget exhausted');
+    expect(completeItem).not.toHaveBeenCalled();
+    await processNewItem(mockEnv, NOTICE_FEED.id, item, 'token', [], 0.85, deadline + 1000);
+    expect(createEvent).toHaveBeenCalledTimes(1);
+    expect(completeItem).toHaveBeenCalledWith(mockEnv, NOTICE_FEED.id, item.id,
+      expect.objectContaining({ eventId: 'existing' }));
+    expect(sendNotification).toHaveBeenCalledTimes(1);
+  });
+
+  it('rotates pending retries while reserving capacity for new posts', async () => {
+    const today = new Date().toISOString().slice(0, 10);
+    const input = { title: '행사', description: '일정', startDate: today, endDate: today };
+    const seed = Array.from({ length: 6 }, (_, index) => {
+      const nttNo = String(index + 101);
+      const meta = { eventId: '', nttNo, processedAt: today, hash: 'old', feedId: NOTICE_FEED.id };
+      return [nttNo, { events: [{ input, hash: 'old', meta }], rssUrl: 'https://www.knue.ac.kr' }] as const;
+    });
+    const plans = new Map<string, unknown>(seed);
+    vi.mocked(listPendingPlans).mockImplementation(async () =>
+      [...plans].map(([nttNo, plan]) => ({ nttNo, plan })),
+    );
+    vi.mocked(putPendingPlan).mockImplementation(async (_env, _feed, nttNo, plan) => {
+      plans.set(nttNo, structuredClone(plan));
+    });
+    const newPost: RssItem = {
+      id: '200', title: '행사', pubDate: today, link: 'https://www.knue.ac.kr/notice/200',
+      descriptionHtml: '새 공지',
+    };
+    vi.mocked(parseRss).mockReturnValueOnce([newPost]).mockReturnValueOnce([]);
+    vi.mocked(generateSummary).mockResolvedValue({
+      summary: '요약', highlights: [], actionItems: [], links: [],
+    });
+    vi.mocked(generateEventInfos).mockResolvedValue([input]);
+    vi.mocked(createEvent).mockImplementation(async (_env, _token, _input, meta, _extras, _attachments, id) => {
+      if (meta.nttNo !== '200') throw new Error('calendar refused pending item');
+      return { id: id! };
+    });
+    vi.mocked(fetch).mockImplementation(async () => new Response('<rss/>'));
+
+    const first = await run(mockEnv, [NOTICE_FEED]);
+    expect(first.created).toBe(1);
+    expect(vi.mocked(createEvent).mock.calls.map((call) => call[3].nttNo))
+      .toEqual(['101', '102', '103', '104', '105', '200']);
+    expect(vi.mocked(updateMaxProcessedId)).toHaveBeenCalledWith(mockEnv, NOTICE_FEED.id, '100');
+
+    vi.mocked(createEvent).mockClear();
+    await run(mockEnv, [NOTICE_FEED]);
+    expect(vi.mocked(createEvent).mock.calls[0][3].nttNo).toBe('106');
   });
 
   describe('run()', () => {
@@ -304,7 +419,7 @@ describe('Integration Tests', () => {
       expect(createEvent).not.toHaveBeenCalled();
 
       // State is marked so the item is not retried next run
-      expect(putProcessedRecord).toHaveBeenCalledWith(
+      expect(completeItem).toHaveBeenCalledWith(
         expect.anything(),
         'bbs250',
         '777',
@@ -368,7 +483,7 @@ describe('Integration Tests', () => {
       const stats = await run(mockEnv, [NOTICE_FEED]);
 
       // The failed item gets no processed record, so the next run re-reads it.
-      const recordedItemIds = (putProcessedRecord as ReturnType<typeof vi.fn>).mock.calls.map(
+      const recordedItemIds = (completeItem as ReturnType<typeof vi.fn>).mock.calls.map(
         (call) => call[2],
       );
       expect(recordedItemIds).not.toContain('201');
@@ -586,7 +701,7 @@ describe('Integration Tests', () => {
       // No AI enrichment, no calendar write, and the record is left untouched.
       expect(generateEventInfos).not.toHaveBeenCalled();
       expect(createEvent).not.toHaveBeenCalled();
-      expect(putProcessedRecord).not.toHaveBeenCalled();
+      expect(completeItem).not.toHaveBeenCalled();
       expect(stats).toEqual({ processed: 1, created: 0 });
 
       // An already-processed item still lets the watermark move forward.

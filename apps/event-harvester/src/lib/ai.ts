@@ -1,17 +1,25 @@
-import type { AiSummary, PreviewContent, CalendarEventInput, RssItem, AiEvent } from "../types.js";
+import type { AiSummary, PreviewContent, CalendarEventInput, RssItem } from "../types.js";
 import { htmlToText } from "./html.js";
 
 export interface AiEnv {
-  OLLAMA_HOST: string;
-  OLLAMA_CONTENT_MODEL: string;
-  OLLAMA_VISION_MODEL?: string;
+  AI_GATEWAY_URL: string;
+  AI_GATEWAY_TOKEN: string;
+  OPENAI_MODEL: string;
 }
 
-interface OllamaResponse {
-  message: {
-    content: string;
-  };
+interface GatewayCompletion {
+  choices?: Array<{
+    finish_reason?: string;
+    message?: { content?: string | null; refusal?: string | null };
+  }>;
 }
+
+type ImagePart = { type: "image_url"; image_url: { url: string } };
+type TextPart = { type: "text"; text: string };
+type ChatMessage = { role: "system" | "user"; content: string | Array<TextPart | ImagePart> };
+
+const AI_TIMEOUT_MS = 30_000;
+const SUPPORTED_IMAGES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
 
 const JSON_FALLBACK: AiSummary = {
   summary: "요약 정보를 생성하지 못했습니다.",
@@ -21,36 +29,46 @@ const JSON_FALLBACK: AiSummary = {
 };
 
 
-async function callOllamaChat(
+async function callGatewayChat(
   env: AiEnv,
-  params: {
-    model: string;
-    messages: Array<{ role: string; content: string; images?: string[] }>;
-    schema: Record<string, unknown>;
-  },
-): Promise<string> {
-  let base = env.OLLAMA_HOST;
-  while (base.endsWith("/")) base = base.slice(0, -1);
-  const endpoint = `${base}/api/chat`;
-  const response = await fetch(endpoint, {
+  params: { name: string; messages: ChatMessage[]; schema: Record<string, unknown> },
+): Promise<string | undefined> {
+  const endpoint = new URL(env.AI_GATEWAY_URL);
+  if (endpoint.origin !== "https://gateway.ai.cloudflare.com" || endpoint.username || endpoint.password ||
+      !/^\/v1\/[^/]+\/[^/]+\/openai\/chat\/completions$/.test(endpoint.pathname)) {
+    throw new Error("Invalid AI Gateway OpenAI Chat Completions URL");
+  }
+  const response = await fetch(endpoint.href, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "cf-aig-authorization": `Bearer ${env.AI_GATEWAY_TOKEN}`,
+    },
+    redirect: "manual",
+    signal: AbortSignal.timeout(AI_TIMEOUT_MS),
     body: JSON.stringify({
-      model: params.model,
+      model: env.OPENAI_MODEL,
       messages: params.messages,
-      format: params.schema,
+      response_format: {
+        type: "json_schema",
+        json_schema: { name: params.name, strict: true, schema: params.schema },
+      },
       stream: false,
-      options: { temperature: 0 },
     }),
   });
 
   if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Ollama request failed (${response.status}): ${errorText.slice(0, 500)}`);
+    throw new Error(`AI Gateway request failed (${response.status})`);
   }
 
-  const data = (await response.json()) as OllamaResponse;
-  return data.message.content;
+  const data = await response.json() as GatewayCompletion | null;
+  const choice = data?.choices?.[0];
+  if (!choice?.message) throw new Error("AI Gateway returned a missing completion choice");
+  if (choice.message.refusal) throw new AiResponseParseError("OpenAI refused the extraction");
+  if (choice.finish_reason !== "stop") {
+    throw new Error("AI Gateway returned an incomplete completion");
+  }
+  return choice.message.content ?? undefined;
 }
 
 async function parseJson(content: string | undefined): Promise<AiSummary> {
@@ -75,7 +93,8 @@ export async function extractTextFromImage(
   preview: PreviewContent,
 ): Promise<string | undefined> {
   if (preview.sourceType !== "image" || !preview.imageBase64) return undefined;
-  const visionModel = env.OLLAMA_VISION_MODEL ?? env.OLLAMA_CONTENT_MODEL;
+  const imageType = preview.contentType?.split(";")[0].trim().toLowerCase() ?? "image/jpeg";
+  if (!SUPPORTED_IMAGES.has(imageType)) return undefined;
 
   const schema = {
     type: "object",
@@ -86,29 +105,29 @@ export async function extractTextFromImage(
     additionalProperties: false,
   };
 
-  try {
-    const content = await callOllamaChat(env, {
-      model: visionModel,
-      messages: [
-        {
-          role: "system",
-          content: "이미지에서 읽을 수 있는 모든 한국어 텍스트를 추출하는 OCR 어시스턴트입니다.",
-        },
-        {
-          role: "user",
-          content: "이미지에서 보이는 텍스트를 원문 그대로 추출해서 JSON 으로 반환해 주세요.",
-          images: [preview.imageBase64],
-        },
-      ],
-      schema,
-    });
+  const content = await callGatewayChat(env, {
+    name: "announcement_image_text",
+    messages: [
+      {
+        role: "system",
+        content: "이미지에서 읽을 수 있는 모든 한국어 텍스트를 추출하는 OCR 어시스턴트입니다.",
+      },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "이미지에서 보이는 텍스트를 원문 그대로 추출해서 JSON 으로 반환해 주세요." },
+          { type: "image_url", image_url: { url: `data:${imageType};base64,${preview.imageBase64}` } },
+        ],
+      },
+    ],
+    schema,
+  });
 
-    const parsed = JSON.parse(content);
-    return typeof parsed.extractedText === "string" ? parsed.extractedText : undefined;
-  } catch (error) {
-    console.error("Vision OCR failed", error);
-    return undefined;
+  const parsed = content ? JSON.parse(content) : null;
+  if (typeof parsed?.extractedText !== "string") {
+    throw new Error("AI Gateway returned no image extraction");
   }
+  return parsed.extractedText;
 }
 
 export async function generateSummary(
@@ -150,8 +169,8 @@ export async function generateSummary(
   };
 
   try {
-    const content = await callOllamaChat(env, {
-      model: env.OLLAMA_CONTENT_MODEL,
+    const content = await callGatewayChat(env, {
+      name: "announcement_summary",
       messages: [
         {
           role: "system",
@@ -179,24 +198,31 @@ export async function generateSummary(
   }
 }
 
-const EVENT_JSON_FALLBACK: CalendarEventInput = {
-  title: "제목 없음",
-  description: "설명 없음",
-  startDate: new Date().toISOString().slice(0, 10),
-  endDate: new Date().toISOString().slice(0, 10),
-  startTime: undefined,
-  endTime: undefined,
-};
+function isCalendarDate(value: unknown): value is string {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const date = new Date(`${value}T00:00:00Z`);
+  return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value;
+}
 
-function buildEventInput(event: AiEvent, pubDate: string): CalendarEventInput {
-  return {
-    title: event.title ?? EVENT_JSON_FALLBACK.title,
-    description: event.description ?? EVENT_JSON_FALLBACK.description,
-    startDate: event.startDate ?? pubDate,
-    endDate: event.endDate ?? (event.startDate ?? pubDate),
-    startTime: typeof event.startTime === "string" ? event.startTime : undefined,
-    endTime: typeof event.endTime === "string" ? event.endTime : undefined,
-  };
+function isOptionalCalendarTime(value: unknown): value is string | null | undefined {
+  return value == null || (typeof value === "string" && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(value));
+}
+
+function buildEventInput(event: unknown, pubDate: string): CalendarEventInput {
+  if (typeof event !== "object" || event === null) {
+    throw new AiResponseParseError("OpenAI returned an invalid event");
+  }
+  const fields = event as Record<string, unknown>;
+  const { title, description, startTime, endTime } = fields;
+  const startDate = fields.startDate ?? pubDate;
+  const endDate = fields.endDate ?? startDate;
+  if (typeof title !== "string" || !title.trim() || typeof description !== "string" || !description.trim() ||
+      !isCalendarDate(startDate) || !isCalendarDate(endDate) || endDate < startDate ||
+      !isOptionalCalendarTime(startTime) || !isOptionalCalendarTime(endTime) ||
+      (endDate === startDate && startTime && endTime && endTime < startTime)) {
+    throw new AiResponseParseError("OpenAI returned an unusable event");
+  }
+  return { title, description, startDate, endDate, startTime: startTime ?? undefined, endTime: endTime ?? undefined };
 }
 
 /**
@@ -227,7 +253,7 @@ function snippet(content: string): string {
 
 async function parseEventJsonArray(content: string | undefined, pubDate: string): Promise<CalendarEventInput[]> {
   if (!content) {
-    throw new AiResponseParseError("Ollama returned no event content");
+    throw new AiResponseParseError("OpenAI returned no event content");
   }
   let data: unknown;
   try {
@@ -245,20 +271,8 @@ async function parseEventJsonArray(content: string | undefined, pubDate: string)
       { payload: content },
     );
   }
-  // An empty array here is the model's genuine "no events" answer — pass it through.
-  const parsed = (events as AiEvent[])
-    .map((event) => buildEventInput(event, pubDate))
-    .filter((event) => event.title && event.description);
-  // The schema allows empty-string title/description, which the fallbacks (`??`) do not
-  // catch. Dropping every event the model actually returned is a failed extraction, not
-  // a "no events" answer — the last path that could silently conflate the two.
-  if (events.length > 0 && parsed.length === 0) {
-    throw new AiResponseParseError(
-      `All ${events.length} extracted event(s) were unusable: ${snippet(content)}`,
-      { payload: content },
-    );
-  }
-  return parsed;
+  // An empty array is the model's genuine "no events" answer.
+  return events.map((event) => buildEventInput(event, pubDate));
 }
 
 export async function generateEventInfos(
@@ -304,8 +318,8 @@ export async function generateEventInfos(
 
   let content: string | undefined;
   try {
-    content = await callOllamaChat(env, {
-      model: env.OLLAMA_CONTENT_MODEL,
+    content = await callGatewayChat(env, {
+      name: "announcement_events",
       messages: [
         {
           role: "system",

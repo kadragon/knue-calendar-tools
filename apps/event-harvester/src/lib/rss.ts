@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { DOMParser as XmldomParser } from "@xmldom/xmldom";
 import type { RssItem } from "../types.js";
 

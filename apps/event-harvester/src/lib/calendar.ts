@@ -19,6 +19,8 @@ export interface CalendarEnv {
 
 export interface GoogleCalendarEvent {
   id: string;
+  status?: string;
+  recovered?: true; // Resolved from an earlier insert with the same application event ID
   htmlLink?: string; // Absolute link to this event in Google Calendar Web UI
   summary?: string;
   description?: string;
@@ -36,6 +38,7 @@ export interface GoogleCalendarEvent {
 
 const DEFAULT_TOKEN_URI = "https://oauth2.googleapis.com/token";
 const SCOPE = "https://www.googleapis.com/auth/calendar";
+const CALENDAR_TIMEOUT_MS = 20_000;
 
 type JwtPayload = Record<string, unknown>;
 
@@ -102,9 +105,8 @@ function parseServiceAccount(env: CalendarEnv): ServiceAccount {
       throw new Error("Invalid service account JSON");
     }
     return parsed;
-  } catch (error) {
-    console.error("Failed to parse GOOGLE_SERVICE_ACCOUNT_JSON", error);
-    throw error;
+  } catch {
+    throw new Error("Invalid service account JSON");
   }
 }
 
@@ -123,6 +125,8 @@ export async function obtainAccessToken(env: CalendarEnv): Promise<string> {
   const assertion = await signJwt(payload, serviceAccount);
   const response = await fetch(serviceAccount.token_uri ?? DEFAULT_TOKEN_URI, {
     method: "POST",
+    redirect: "manual",
+    signal: AbortSignal.timeout(CALENDAR_TIMEOUT_MS),
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
     },
@@ -133,8 +137,7 @@ export async function obtainAccessToken(env: CalendarEnv): Promise<string> {
   });
 
   if (!response.ok) {
-    const errorText = await response.text();
-    console.error("Failed to obtain access token", response.status, errorText);
+    await response.body?.cancel();
     throw new Error(`Google OAuth error: ${response.status}`);
   }
 
@@ -149,6 +152,7 @@ export async function listEvents(
 ): Promise<GoogleCalendarEvent[]> {
   const allEvents: GoogleCalendarEvent[] = [];
   let nextPageToken: string | undefined;
+  const signal = AbortSignal.timeout(CALENDAR_TIMEOUT_MS);
 
   do {
     const url = new URL(
@@ -165,6 +169,7 @@ export async function listEvents(
     }
 
     const response = await fetch(url.toString(), {
+      signal,
       headers: {
         Authorization: `Bearer ${token}`,
       },
@@ -195,6 +200,7 @@ export async function createEvent(
   meta: ProcessedRecord,
   descriptionExtras?: Record<string, unknown>,
   attachments?: GoogleCalendarAttachment[],
+  eventId?: string,
 ): Promise<GoogleCalendarEvent> {
   const startDate = input.startDate;
   const endDate = input.endDate;
@@ -216,6 +222,7 @@ export async function createEvent(
   }
 
   const body: Record<string, unknown> = {
+    ...(eventId ? { id: eventId } : {}),
     summary: input.title,
     description: input.description,
     start,
@@ -230,6 +237,7 @@ export async function createEvent(
             typeof value === "string" ? value : JSON.stringify(value),
           ]),
         ),
+        ...(eventId ? { knueHarvestId: eventId, nttNo: meta.nttNo, feedId: meta.feedId } : {}),
       },
     },
   };
@@ -247,8 +255,10 @@ export async function createEvent(
     url.searchParams.set("supportsAttachments", "true");
   }
 
+  const signal = AbortSignal.timeout(CALENDAR_TIMEOUT_MS);
   const response = await fetch(url.toString(), {
     method: "POST",
+    signal,
     headers: {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
@@ -256,13 +266,35 @@ export async function createEvent(
     body: JSON.stringify(body),
   });
 
+  if (response.status === 409 && eventId) {
+    url.pathname += `/${encodeURIComponent(eventId)}`;
+    url.search = "";
+    const existing = await fetch(url.toString(), {
+      signal,
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!existing.ok) throw new Error(`Google Calendar conflict lookup error ${existing.status}`);
+
+    const event = await existing.json() as GoogleCalendarEvent;
+    const properties = event?.extendedProperties?.private;
+    if (event?.id !== eventId || event.status === "cancelled" || properties?.knueHarvestId !== eventId ||
+        properties.nttNo !== meta.nttNo || properties.feedId !== meta.feedId) {
+      throw new Error("Google Calendar event ownership mismatch");
+    }
+    return { ...event, recovered: true };
+  }
+
   if (!response.ok) {
     const errorText = await response.text();
     console.error("Failed to create calendar event", response.status, errorText);
     throw new Error(`Google Calendar create error ${response.status}`);
   }
 
-  return (await response.json()) as GoogleCalendarEvent;
+  const event = await response.json() as GoogleCalendarEvent;
+  if (eventId && event?.id !== eventId) {
+    throw new Error("Google Calendar event ID mismatch");
+  }
+  return event;
 }
 
 function addDays(date: string, days: number): string {

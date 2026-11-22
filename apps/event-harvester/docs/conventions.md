@@ -9,7 +9,7 @@ Only conventions agents frequently get wrong are listed here. The linter catches
 | Source files | lowercase single-word (or hyphenated) | `state.ts`, `rss.ts` |
 | Functions / variables | camelCase | `fetchRssFeed`, `nttNo` |
 | Classes / types / interfaces | PascalCase, no `I` prefix | `CalendarEvent`, `RssItem` |
-| Environment variable names | SCREAMING_SNAKE_CASE | `OLLAMA_HOST`, `DATABASE_PATH` |
+| Environment variable names | SCREAMING_SNAKE_CASE | `AI_GATEWAY_URL`, `OPENAI_MODEL` |
 | SQLite column names | snake_case | `ntt_no`, `processed_at` |
 | camelCase ↔ snake_case boundary | At `src/lib/state.ts` — DB layer uses snake_case; all callers use camelCase | `ntt_no` in SQL → `nttNo` in TS |
 

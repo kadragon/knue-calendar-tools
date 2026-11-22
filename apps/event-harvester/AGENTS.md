@@ -1,6 +1,6 @@
 # KNUE Event Harvester Agent Rules
 
-Node 22 + TypeScript cron CLI: pulls KNUE bulletin RSS → enriches via local Ollama → deduplicates against SQLite → publishes to Google Calendar + Telegram.
+Scheduled Cloudflare Worker for KNUE RSS, AI Gateway extraction, and Google Calendar + Telegram.
 
 ## Docs Index (read on demand)
 
@@ -18,8 +18,8 @@ Node 22 + TypeScript cron CLI: pulls KNUE bulletin RSS → enriches via local Ol
 Violations block commits or fail CI. No exceptions.
 
 1. **Coverage thresholds hold** — `src/lib/**` must meet lines 80 / functions 80 / branches 75. Enforced: `vitest.config.ts` thresholds + CI.
-2. **TypeScript strict + ESM `.js` suffix** — strict mode on; relative imports require `.js` extension (NodeNext). Enforced: `tsc --noEmit` in lefthook + CI.
-3. **SQLite schema is additive only** — no `DROP COLUMN`, `DROP TABLE`, or `RENAME COLUMN` in `src/lib/state.ts`. Breaking changes wipe `data/state.db`. Enforced: `pre-commit-schema-guard.sh` in lefthook.
+2. **TypeScript strict + ESM `.js` suffix** — strict mode on; relative imports require `.js` extension (NodeNext). Enforced: `tsc --noEmit` in CI.
+3. **Preserve stored state** — keep snapshot imports and pending plans compatible. Enforced by Durable Object and importer tests.
 4. **Per-item loop errors never abort `run()`** — one bad RSS item must not stop the rest. Enforced: integration test assertion in `test/`.
 5. **Commit format `[TYPE] description`** — TYPE ∈ `FEAT FIX REFACTOR DOCS HARNESS CONSTRAINT PLAN TEST CHORE`. Enforced: `commit-msg-format.sh` (advisory for humans, blocking for Claude sessions).
 
@@ -32,7 +32,7 @@ Read `docs/delegation.md` for context manifests. All triggers are objective.
 | First edit in `src/` or `test/` this session | `Explore` subagent | sonnet | Mandatory |
 | Change touches `src/lib/state.ts` | `feature-dev:code-explorer` | sonnet | Mandatory |
 | Change touches `src/lib/calendar.ts` | `feature-dev:code-explorer` | sonnet | Mandatory |
-| Change touches `run.sh` or `.github/workflows/` | `Explore` subagent | sonnet | Mandatory |
+| Change touches `wrangler.jsonc` or a workflow | `Explore` subagent | sonnet | Mandatory |
 | Change touches ≥3 files across `src/` | `Plan` subagent | sonnet | Mandatory before edits |
 | Same failure 2× | `codex:rescue` | — | Escalation |
 | Post-implementation (always) | `feature-dev:code-reviewer` | sonnet | Mandatory |
@@ -50,7 +50,7 @@ Rules that apply every message — keep the context window lean.
 ## Working with Existing Code
 
 - `src/lib/state.ts` schema is additive only — no migration framework. Dropping or renaming columns deletes `data/state.db` for all users.
-- Single-instance execution — concurrent `run.sh` invocations create duplicate Calendar events. Cron must use `flock` (see `docs/runbook.md`).
+- Save the entire event plan before Calendar writes. Finalize the item only after every event is created or reconciled.
 
 ## Language Policy
 

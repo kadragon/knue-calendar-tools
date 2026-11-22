@@ -1,298 +1,164 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import Database from 'better-sqlite3';
-import {
-  openDatabase,
-  getProcessedRecord,
-  putProcessedRecord,
-  getMaxProcessedId,
-  updateMaxProcessedId,
-  getItemFailureCount,
-  recordItemFailure,
-  clearItemFailureCount,
-  type StateEnv,
-} from '../../src/lib/state.js';
-import type { ProcessedRecord } from '../../src/types.js';
+import { build } from "esbuild";
+import { convertV4MiniflareOptions, Miniflare } from "miniflare";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import type { HarvestState } from "../../src/harvest-state.js";
 
-describe('State Module', () => {
-  let db: Database.Database;
-  let env: StateEnv;
+let runtime: Miniflare;
 
-  beforeEach(() => {
-    db = new Database(':memory:');
-    db.pragma('journal_mode = WAL');
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS processed_items (
-        ntt_no       TEXT PRIMARY KEY,
-        event_id     TEXT NOT NULL,
-        processed_at TEXT NOT NULL,
-        hash         TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS meta (
-        key   TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-      );
-    `);
-    env = { db };
+const record = {
+  feedId: "bbs28",
+  nttNo: "123",
+  eventId: "calendar-event-id",
+  processedAt: "2026-01-01T00:00:00Z",
+  hash: "summary-hash",
+};
+const empty = { version: 1, records: [], watermarks: [], failures: [] };
+
+beforeAll(async () => {
+  const bundle = await build({
+    stdin: {
+      contents: `
+        export { HarvestState } from "./src/harvest-state.ts";
+        export default {
+          async fetch(request, env) {
+            const { name, method, args } = await request.json();
+            const stub = env.HARVEST_STATE.getByName(name);
+            try {
+              return Response.json({ value: await stub[method](...args) });
+            } catch (error) {
+              return Response.json({ error: error.message }, { status: 400 });
+            }
+          },
+        };
+      `,
+      resolveDir: process.cwd(),
+    },
+    bundle: true,
+    write: false,
+    format: "esm",
+    external: ["cloudflare:workers"],
+  });
+  runtime = new Miniflare(convertV4MiniflareOptions({
+    name: "state-worker",
+    modules: true,
+    script: bundle.outputFiles[0].text,
+    compatibilityDate: "2026-11-21",
+    durableObjects: { HARVEST_STATE: { className: "HarvestState", useSQLite: true } },
+  }));
+  await runtime.ready;
+});
+
+afterAll(async () => {
+  await runtime?.dispose();
+});
+
+type StateRpc = {
+  [K in keyof HarvestState as HarvestState[K] extends (...args: never[]) => unknown ? K : never]:
+    HarvestState[K] extends (...args: infer Args) => infer Return
+      ? (...args: Args) => Promise<Awaited<Return>>
+      : never;
+};
+
+function getState(name: string): StateRpc {
+  // Use the Worker RPC path so workerd serializes both results and remote errors.
+  return new Proxy({} as StateRpc, {
+    get(_, method) {
+      return async (...args: unknown[]) => {
+        const response = await runtime.dispatchFetch("http://local/state", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name, method, args }),
+        });
+        const result = await response.json() as { value?: unknown; error?: string };
+        if (!response.ok) throw new Error(result.error);
+        return result.value;
+      };
+    },
+  });
+}
+
+describe("harvester state on workerd", () => {
+  it("requires initialization and rejects malformed imports without changing state", async () => {
+    const state = getState("bootstrap");
+    expect(await state.getImportStatus()).toBeNull();
+    expect(await state.acquireLease()).toBeNull();
+    await expect(state.importSnapshot({ ...empty, watermarks: [{ feedId: "bbs28", id: -1 }] }))
+      .rejects.toThrow("Invalid state snapshot number");
+    await expect(state.importSnapshot({ ...empty, records: [record, record] }))
+      .rejects.toThrow("Duplicate state snapshot key");
+    expect(await state.getImportStatus()).toBeNull();
+    expect(await state.importSnapshot(empty)).toEqual({ records: 0, watermarks: 0, failures: 0 });
+    expect(await state.acquireLease()).toBeTypeOf("string");
   });
 
-  afterEach(() => {
-    db.close();
+  it("reconciles an equivalent repeat import and preserves live changes", async () => {
+    const state = getState("reimport");
+    const secondRecord = { ...record, feedId: "bbs50", eventId: "", hash: "" };
+    const snapshot = {
+      version: 1,
+      records: [record, secondRecord],
+      watermarks: [{ feedId: "bbs28", id: 100 }],
+      failures: [{ feedId: "bbs28", nttNo: "124", count: 2 }],
+    };
+    const counts = { records: 2, watermarks: 1, failures: 1 };
+    expect(await state.importSnapshot(snapshot)).toEqual(counts);
+    expect(await state.getImportStatus()).toEqual(counts);
+    const token = await state.acquireLease() as string;
+    expect(await state.getProcessedRecord(token, "bbs28", "123")).toEqual(record);
+    expect(await state.getProcessedRecord(token, "bbs50", "123")).toEqual(secondRecord);
+    expect(await state.getProcessedRecord(token, "other", "123")).toBeNull();
+    expect(await state.getMaxProcessedId(token, "bbs28")).toBe(100);
+    expect(await state.getItemFailureCount(token, "bbs28", "124")).toBe(2);
+
+    await state.updateMaxProcessedId(token, "bbs28", 200);
+    await state.updateMaxProcessedId(token, "bbs28", 150);
+    await state.updateMaxProcessedId(token, "bbs50", 20);
+    expect(await state.recordItemFailure(token, "bbs28", "124")).toBe(3);
+    expect(await state.getItemFailureCount(token, "bbs50", "124")).toBe(0);
+    await state.clearItemFailureCount(token, "bbs28", "124");
+
+    expect(await state.importSnapshot({ ...snapshot, records: [secondRecord, record] })).toEqual(counts);
+    await expect(state.importSnapshot(empty)).rejects.toThrow("different state snapshot");
+    expect(await state.getMaxProcessedId(token, "bbs28")).toBe(200);
+    expect(await state.getMaxProcessedId(token, "bbs50")).toBe(20);
+    expect(await state.getItemFailureCount(token, "bbs28", "124")).toBe(0);
   });
 
-  describe('openDatabase', () => {
-    it('creates tables and returns a Database instance', () => {
-      const tmpDb = openDatabase(':memory:');
-      try {
-        const tables = tmpDb
-          .prepare("SELECT name FROM sqlite_master WHERE type='table'")
-          .all() as Array<{ name: string }>;
-        const names = tables.map((r) => r.name);
-        expect(names).toContain('processed_items');
-        expect(names).toContain('meta');
-      } finally {
-        tmpDb.close();
-      }
-    });
+  it("serializes overlapping leases and fences a stale owner", async () => {
+    const state = getState("overlap");
+    await state.importSnapshot(empty);
+    const leases = await Promise.all([state.acquireLease(), state.acquireLease()]);
+    expect(leases.filter(Boolean)).toHaveLength(1);
+    const first = leases.find(Boolean) as string;
+    await state.releaseLease(first);
+    const second = await state.acquireLease() as string;
+    expect(second).not.toBe(first);
+    await state.releaseLease(first);
+    expect(await state.acquireLease()).toBeNull();
+    await expect(state.completeItem(first, "bbs28", "123", record)).rejects.toThrow("lease");
+    await state.completeItem(second, "bbs28", "123", record);
+    expect(await state.getProcessedRecord(second, "bbs28", "123")).toEqual(record);
   });
 
-  describe('getProcessedRecord', () => {
-    it('returns record stored with namespaced key', async () => {
-      const record: ProcessedRecord = {
-        eventId: 'test-event',
-        nttNo: '123',
-        processedAt: '2023-01-01T00:00:00Z',
-        hash: 'test-hash',
-        feedId: 'bbs250',
-      };
-      await putProcessedRecord(env, 'bbs250', '123', record);
+  it("recovers a persisted plan and finalizes record, failure count, and plan together", async () => {
+    const state = getState("pending");
+    await state.importSnapshot(empty);
+    const first = await state.acquireLease() as string;
+    const plan = { eventIds: ["a", "b"] };
+    await state.putPendingPlan(first, "bbs28", "post:with:colon", plan);
+    await state.recordItemFailure(first, "bbs28", "post:with:colon");
+    await runtime.unsafeEvictDurableObject("state-worker", "HarvestState", { name: "pending" });
+    expect(await state.acquireLease()).toBeNull();
+    await state.releaseLease(first);
 
-      const result = await getProcessedRecord(env, 'bbs250', '123');
-      expect(result).toEqual(record);
-    });
-
-    it('does not return record from a different feed with same nttNo', async () => {
-      const record: ProcessedRecord = {
-        eventId: 'test-event',
-        nttNo: '123',
-        processedAt: '2023-01-01T00:00:00Z',
-        hash: 'test-hash',
-        feedId: 'bbs250',
-      };
-      await putProcessedRecord(env, 'bbs250', '123', record);
-
-      const result = await getProcessedRecord(env, 'bbs28', '123');
-      expect(result).toBeNull();
-    });
-
-    it('returns null when key not found', async () => {
-      const result = await getProcessedRecord(env, 'bbs28', 'nonexistent-id');
-      expect(result).toBeNull();
-    });
-
-    it('falls back to legacy raw-nttNo row when feedId is bbs28', async () => {
-      db.prepare(
-        'INSERT INTO processed_items (ntt_no, event_id, processed_at, hash) VALUES (?, ?, ?, ?)',
-      ).run('legacy-123', 'event-legacy', '2023-01-01T00:00:00Z', 'legacy-hash');
-
-      const result = await getProcessedRecord(env, 'bbs28', 'legacy-123');
-      expect(result).toEqual({
-        eventId: 'event-legacy',
-        nttNo: 'legacy-123',
-        processedAt: '2023-01-01T00:00:00Z',
-        hash: 'legacy-hash',
-        feedId: 'bbs28',
-      });
-    });
-
-    it('self-heals legacy row by writing the namespaced key on fallback read', async () => {
-      db.prepare(
-        'INSERT INTO processed_items (ntt_no, event_id, processed_at, hash) VALUES (?, ?, ?, ?)',
-      ).run('legacy-777', 'event-heal', '2023-02-02T00:00:00Z', 'heal-hash');
-
-      const result = await getProcessedRecord(env, 'bbs28', 'legacy-777');
-
-      expect(result).toEqual({
-        eventId: 'event-heal',
-        nttNo: 'legacy-777',
-        processedAt: '2023-02-02T00:00:00Z',
-        hash: 'heal-hash',
-        feedId: 'bbs28',
-      });
-
-      const namespaced = db
-        .prepare('SELECT event_id, processed_at, hash FROM processed_items WHERE ntt_no = ?')
-        .get('bbs28:legacy-777') as { event_id: string; processed_at: string; hash: string } | undefined;
-      expect(namespaced).toEqual({
-        event_id: 'event-heal',
-        processed_at: '2023-02-02T00:00:00Z',
-        hash: 'heal-hash',
-      });
-    });
-
-    it('does not fall back to legacy row for non-bbs28 feeds', async () => {
-      db.prepare(
-        'INSERT INTO processed_items (ntt_no, event_id, processed_at, hash) VALUES (?, ?, ?, ?)',
-      ).run('legacy-123', 'event-legacy', '2023-01-01T00:00:00Z', 'legacy-hash');
-
-      const result = await getProcessedRecord(env, 'bbs250', 'legacy-123');
-      expect(result).toBeNull();
-    });
-  });
-
-  describe('putProcessedRecord', () => {
-    it('stores record using namespaced key', async () => {
-      const record: ProcessedRecord = {
-        eventId: 'test-event',
-        nttNo: '123',
-        processedAt: '2023-01-01T00:00:00Z',
-        hash: 'test-hash',
-        feedId: 'bbs28',
-      };
-
-      await putProcessedRecord(env, 'bbs28', '123', record);
-
-      const row = db
-        .prepare('SELECT ntt_no FROM processed_items WHERE ntt_no = ?')
-        .get('bbs28:123') as { ntt_no: string } | undefined;
-      expect(row?.ntt_no).toBe('bbs28:123');
-    });
-
-    it('overwrites existing record (upsert)', async () => {
-      const original: ProcessedRecord = {
-        eventId: 'original-event',
-        nttNo: '456',
-        processedAt: '2023-01-01T00:00:00Z',
-        hash: 'original-hash',
-        feedId: 'bbs28',
-      };
-      const updated: ProcessedRecord = {
-        ...original,
-        eventId: 'updated-event',
-        processedAt: '2023-06-15T12:00:00Z',
-        hash: 'updated-hash',
-      };
-
-      await putProcessedRecord(env, 'bbs28', '456', original);
-      await putProcessedRecord(env, 'bbs28', '456', updated);
-
-      const result = await getProcessedRecord(env, 'bbs28', '456');
-      expect(result).toEqual(updated);
-    });
-
-    it('keeps records from different feeds isolated even when nttNo collides', async () => {
-      const a: ProcessedRecord = {
-        eventId: 'evt-a',
-        nttNo: '999',
-        processedAt: '2023-01-01T00:00:00Z',
-        hash: 'hash-a',
-        feedId: 'bbs28',
-      };
-      const b: ProcessedRecord = {
-        ...a,
-        eventId: 'evt-b',
-        hash: 'hash-b',
-        feedId: 'bbs250',
-      };
-
-      await putProcessedRecord(env, 'bbs28', '999', a);
-      await putProcessedRecord(env, 'bbs250', '999', b);
-
-      expect(await getProcessedRecord(env, 'bbs28', '999')).toEqual(a);
-      expect(await getProcessedRecord(env, 'bbs250', '999')).toEqual(b);
-    });
-  });
-
-  describe('getMaxProcessedId', () => {
-    it('returns per-feed stored max ID', async () => {
-      db.prepare("INSERT INTO meta (key, value) VALUES ('_max_processed_id:bbs250', '5000')").run();
-
-      const result = await getMaxProcessedId(env, 'bbs250');
-      expect(result).toBe(5000);
-    });
-
-    it('returns 0 when no max ID is stored for the feed', async () => {
-      const result = await getMaxProcessedId(env, 'bbs250');
-      expect(result).toBe(0);
-    });
-
-    it('falls back to legacy key for bbs28 feed', async () => {
-      db.prepare("INSERT INTO meta (key, value) VALUES ('_max_processed_id', '1234')").run();
-
-      expect(await getMaxProcessedId(env, 'bbs28')).toBe(1234);
-      expect(await getMaxProcessedId(env, 'bbs250')).toBe(0);
-    });
-
-    it('returns 0 when stored value is not a number', async () => {
-      db.prepare(
-        "INSERT INTO meta (key, value) VALUES ('_max_processed_id:bbs28', 'not-a-number')",
-      ).run();
-
-      expect(await getMaxProcessedId(env, 'bbs28')).toBe(0);
-    });
-  });
-
-  describe('updateMaxProcessedId', () => {
-    it('updates per-feed max ID when new ID is larger', async () => {
-      db.prepare("INSERT INTO meta (key, value) VALUES ('_max_processed_id:bbs28', '5000')").run();
-
-      await updateMaxProcessedId(env, 'bbs28', '5100');
-
-      expect(await getMaxProcessedId(env, 'bbs28')).toBe(5100);
-    });
-
-    it('does not update when new ID is smaller than current max', async () => {
-      db.prepare("INSERT INTO meta (key, value) VALUES ('_max_processed_id:bbs28', '5000')").run();
-
-      await updateMaxProcessedId(env, 'bbs28', '4999');
-
-      expect(await getMaxProcessedId(env, 'bbs28')).toBe(5000);
-    });
-
-    it('updates independent max IDs per feed', async () => {
-      await updateMaxProcessedId(env, 'bbs28', '100');
-      await updateMaxProcessedId(env, 'bbs250', '9000');
-
-      expect(await getMaxProcessedId(env, 'bbs28')).toBe(100);
-      expect(await getMaxProcessedId(env, 'bbs250')).toBe(9000);
-    });
-
-    it('does not update and does not throw when new ID is not a number', async () => {
-      db.prepare("INSERT INTO meta (key, value) VALUES ('_max_processed_id:bbs28', '5000')").run();
-
-      await updateMaxProcessedId(env, 'bbs28', 'not-a-number');
-
-      expect(await getMaxProcessedId(env, 'bbs28')).toBe(5000);
-    });
-  });
-
-  describe('item failure counts', () => {
-    it('persists consecutive failures per feed and item', async () => {
-      expect(await getItemFailureCount(env, 'bbs28', '123')).toBe(0);
-
-      expect(await recordItemFailure(env, 'bbs28', '123')).toBe(1);
-      expect(await recordItemFailure(env, 'bbs28', '123')).toBe(2);
-      expect(await getItemFailureCount(env, 'bbs28', '123')).toBe(2);
-
-      expect(await recordItemFailure(env, 'bbs250', '123')).toBe(1);
-      expect(await getItemFailureCount(env, 'bbs28', '123')).toBe(2);
-      expect(await getItemFailureCount(env, 'bbs250', '123')).toBe(1);
-    });
-
-    it('clears a failure count so a later failure starts a new streak', async () => {
-      await recordItemFailure(env, 'bbs28', '123');
-      await recordItemFailure(env, 'bbs28', '123');
-
-      await clearItemFailureCount(env, 'bbs28', '123');
-
-      expect(await getItemFailureCount(env, 'bbs28', '123')).toBe(0);
-      expect(await recordItemFailure(env, 'bbs28', '123')).toBe(1);
-    });
-
-    it('treats a malformed stored count as zero', async () => {
-      db.prepare("INSERT INTO meta (key, value) VALUES ('_item_failure_count:bbs28:123', 'invalid')").run();
-
-      expect(await getItemFailureCount(env, 'bbs28', '123')).toBe(0);
-      expect(await recordItemFailure(env, 'bbs28', '123')).toBe(1);
-    });
+    const second = await state.acquireLease() as string;
+    expect(await state.getPendingPlan(second, "bbs28", "post:with:colon")).toEqual(plan);
+    expect(await state.listPendingPlans(second, "bbs28")).toEqual([{ nttNo: "post:with:colon", plan }]);
+    expect(await state.listPendingPlans(second, "bbs50")).toEqual([]);
+    const finished = { ...record, nttNo: "post:with:colon" };
+    await state.completeItem(second, "bbs28", "post:with:colon", finished);
+    expect(await state.getProcessedRecord(second, "bbs28", "post:with:colon")).toEqual(finished);
+    expect(await state.getPendingPlan(second, "bbs28", "post:with:colon")).toBeNull();
+    expect(await state.getItemFailureCount(second, "bbs28", "post:with:colon")).toBe(0);
   });
 });

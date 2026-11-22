@@ -45,6 +45,8 @@ export async function sendNotification(
     // Trace: SPEC-TELEGRAM-IMPROVEMENTS-001, AC-1 (disable_web_page_preview)
     const response = await fetch(apiUrl, {
       method: 'POST',
+      redirect: 'manual',
+      signal: AbortSignal.timeout(10_000),
       headers: {
         'Content-Type': 'application/json',
       },
@@ -58,9 +60,9 @@ export async function sendNotification(
 
     // AC-3: Handle API errors silently
     if (!response.ok) {
-      const errorText = await response.text();
+      await response.body?.cancel();
       console.error(
-        `[Telegram] Failed to send message: ${response.status} - ${errorText}`
+        `[Telegram] Failed to send message: ${response.status}`
       );
       return;
     }
@@ -68,7 +70,7 @@ export async function sendNotification(
     console.log('[Telegram] Notification sent successfully');
   } catch (error) {
     // AC-3: Log network errors and continue
-    console.error('[Telegram] Error sending notification:', error);
+    console.error('[Telegram] Error sending notification:', error instanceof Error ? error.name : 'error');
     return;
   }
 }

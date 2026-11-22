@@ -27,7 +27,7 @@ echo -e "${CYAN}=== Sweep ===${NC}"
 echo -e "  Date: $(date '+%Y-%m-%d %H:%M')"
 
 # ── 1. Lint scan ─────────────────────────────────────────────
-echo -e "${CYAN}[1/5] Lint scan (tsc --noEmit)...${NC}"
+echo -e "${CYAN}[1/4] Lint scan (tsc --noEmit)...${NC}"
 if lint_output=$(npm run lint 2>&1); then
   echo -e "  ${GREEN}Lint clean${NC}"
 else
@@ -39,51 +39,24 @@ fi
 $QUICK_MODE && { echo "Quick mode — done."; exit 0; }
 
 # ── 2. Test coverage gate ────────────────────────────────────
-echo -e "${CYAN}[2/5] Test coverage (80/80/75 thresholds)...${NC}"
+echo -e "${CYAN}[2/4] Test coverage (80/80/75 thresholds)...${NC}"
 if npm run test:coverage --silent 2>&1 | tail -5; then
   echo -e "  ${GREEN}Coverage thresholds met${NC}"
 else
   FINDINGS+=("[coverage] One or more coverage thresholds (lines 80 / functions 80 / branches 75) failed")
 fi
 
-# ── 3. Doc drift check ──────────────────────────────────────
-echo -e "${CYAN}[3/5] Doc drift (stale Cloudflare text)...${NC}"
-stale_patterns=("Wrangler" "wrangler" "OPENAI_API_KEY" "\.wrangler" "KV store" "KV binding")
-drift_found=0
-for pat in "${stale_patterns[@]}"; do
-  if grep -q "$pat" README.md 2>/dev/null; then
-    FINDINGS+=("[doc-drift] README.md contains stale Cloudflare reference: '$pat'")
-    drift_found=1
-  fi
-done
-[[ $drift_found -eq 0 ]] && echo -e "  ${GREEN}No stale CF text found${NC}"
-
-# ── 4. Golden principle spot-check ───────────────────────────
-echo -e "${CYAN}[4/5] Golden principles...${NC}"
+# ── 3. Worker boundary and secret checks ──────────────────────
+echo -e "${CYAN}[3/4] Worker boundary and secrets...${NC}"
 gp_issues=0
 
-# GP3: no destructive schema operations in state.ts
-schema_violations=()
-while IFS= read -r line; do
-  if [[ "$line" =~ DROP[[:space:]]+COLUMN ]]; then
-    schema_violations+=("DROP COLUMN: $line")
-  fi
-  if [[ "$line" =~ DROP[[:space:]]+TABLE ]]; then
-    schema_violations+=("DROP TABLE: $line")
-  fi
-  if [[ "$line" =~ RENAME[[:space:]]+COLUMN ]]; then
-    schema_violations+=("RENAME COLUMN: $line")
-  fi
-done < src/lib/state.ts
-if [[ ${#schema_violations[@]} -gt 0 ]]; then
-  for v in "${schema_violations[@]}"; do
-    FINDINGS+=("[gp3-schema] Destructive schema operation: $v")
-    gp_issues=1
-  done
+if grep -REn 'better-sqlite3|from "node:fs"|import\("dotenv"\)' src/; then
+  FINDINGS+=("[worker-runtime] Server-only dependency found in Worker source")
+  gp_issues=1
 fi
 
 # Secret leak check: console.log of sensitive env var values
-secret_patterns=("GOOGLE_SERVICE_ACCOUNT_JSON" "TELEGRAM_BOT_TOKEN" "private_key")
+secret_patterns=("GOOGLE_SERVICE_ACCOUNT_JSON" "TELEGRAM_BOT_TOKEN" "AI_GATEWAY_TOKEN" "STATE_IMPORT_TOKEN" "private_key")
 while IFS= read -r sfile; do
   for spat in "${secret_patterns[@]}"; do
     while IFS= read -r sline; do
@@ -97,8 +70,8 @@ done < <(find src/ -name "*.ts" 2>/dev/null)
 
 [[ $gp_issues -eq 0 ]] && echo -e "  ${GREEN}No golden principle violations${NC}"
 
-# ── 5. Harness freshness ────────────────────────────────────
-echo -e "${CYAN}[5/5] Harness freshness...${NC}"
+# ── 4. Harness freshness ────────────────────────────────────
+echo -e "${CYAN}[4/4] Harness freshness...${NC}"
 harness_issues=0
 
 # AGENTS.md line count

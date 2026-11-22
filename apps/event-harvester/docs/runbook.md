@@ -1,119 +1,81 @@
-# Runbook
+# Harvester Runbook
 
-## Commands
+Run commands from `apps/event-harvester`. Use Node.js 22 or newer and the Wrangler
+installed by `npm ci`. The staging environment has a separate Worker and Durable
+Object. Both schedules ship disabled so importing state and enabling cron are
+separate operations.
 
-```bash
-# Development
-npm run build          # tsc compile to dist/
-npm start              # node dist/index.js
-npm run lint           # tsc --noEmit (type-check only, no output)
-npm test               # vitest run
-npm run test:coverage  # vitest run --coverage (checks 80/80/75 thresholds on src/lib/**)
-```
+## Settings
 
-## Running Locally
+| Setting | Purpose |
+| --- | --- |
+| `AI_GATEWAY_URL` | Full provider-native URL ending in `/openai/chat/completions` |
+| `AI_GATEWAY_TOKEN` | Token for the authenticated gateway |
+| `OPENAI_MODEL` | OpenAI model with image and structured output support |
+| `GOOGLE_CALENDAR_ID` | Calendar shared with the service account |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | Service account credentials as a single JSON string |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_USER_ID` | Optional notification destination |
+| `STATE_IMPORT_TOKEN` | Temporary secret enabling the snapshot endpoint |
+| `SIMILARITY_THRESHOLD`, `LOOKBACK_DAYS` | Optional matching overrides, defaulting to 0.85 and 60 |
 
-```bash
-cp .env.example .env
-# Fill in .env values (see Environment Variables below)
-npm install
-npm run build
-node dist/index.js
-```
+Configure the OpenAI API key as BYOK in AI Gateway. Set credentials as Worker
+secrets in the intended environment and use separate test credentials and a
+separate Google Calendar for staging. A protected JSON file or standard input
+can be passed to `npx wrangler secret bulk --env staging`.
 
-Logs to stdout by default. Run via `run.sh` to get file-based logging.
+## Local and staging verification
 
-## Cron Setup (Production)
+Run `npm run test:coverage` for local scheduled runs with stubbed services. For a
+manual local run, supply test settings in an ignored `.dev.vars`, initialize the
+local Durable Object using the import endpoint, then run
+`npm run dev -- --test-scheduled`. Wrangler exposes a local handler at
+`/cdn-cgi/local/scheduled`.
 
-`run.sh` handles: `git pull --ff-only`, conditional rebuild (keyed on `package-lock.json` md5 stored in `.lock-hash`), then `node dist/index.js`. Logs go to `logs/harvester-YYYY-MM-DD.log`.
+For staging, use `npm run deploy -- --env staging` after configuring the staging
+settings. Initialize the staging state, then set the staging cron expression in
+`wrangler.jsonc` and deploy staging again. Confirm one scheduled run with the
+test calendar, including a bulletin with an image. Restore the staging schedule
+to an empty list when the check is complete.
 
-**Single-instance requirement:** concurrent invocations create duplicate Calendar events. Use `flock`:
+## Import and production cutover
 
-```cron
-# Run every 15 minutes, max one instance
-*/15 * * * * flock -n /tmp/knue-harvester.lock bash /home/user/knue-event-harvester/run.sh
-```
+1. Confirm the currently deployed ICS Worker and its subscription URL. The ICS
+   Worker configuration is carried into this repository unchanged.
+2. Deploy the harvester with the production schedule empty. For the one-time
+   import, temporarily set production `workers_dev` to `true` and set a unique
+   `STATE_IMPORT_TOKEN` secret. The endpoint is accessible only with that token.
+3. Stop the old cron and wait for the last process to finish. Keep a backup of
+   the production SQLite file with any associated WAL files. Export the stopped
+   database using a private output directory:
 
-### systemd timer (alternative)
+   ```sh
+   umask 077
+   mkdir -p data
+   python3 scripts/export-state.py /path/to/production/state.db > data/import.json
+   ```
 
-On systemd hosts, a user timer integrates with journald and guarantees non-overlap (`Type=oneshot` never runs concurrently with itself), so `flock` is not required.
+4. Compare records, watermarks, and failure counts before import. For an empty
+   staging calendar, the explicit bootstrap snapshot is
+   `{"version":1,"records":[],"watermarks":[],"failures":[]}`.
+5. Write `Authorization: Bearer ...` to a private `data/import.headers` file and
+   submit the snapshot. Use the intended Worker's exact URL in `worker_url`.
+   The endpoint accepts snapshots up to 4 MiB and returns import counts. Repeating
+   the same normalized snapshot is safe.
 
-`~/.config/systemd/user/knue-harvester.service`:
+   ```sh
+   curl --fail-with-body --header @data/import.headers \
+     --header 'Content-Type: application/json' --data-binary @data/import.json \
+     "$worker_url/__migration/state"
+   curl --fail-with-body --header @data/import.headers "$worker_url/__migration/state"
+   ```
 
-```ini
-[Unit]
-Description=KNUE Event Harvester
-After=network-online.target
-Wants=network-online.target
+6. Compare returned counts with the export. Remove the import token, restore
+   production `workers_dev` to `false`, set the production schedule to
+   `["*/15 * * * *"]`, and deploy explicitly with `npm run deploy -- --env ""`.
+   Confirm the actual trigger and first scheduled run in Cloudflare. Compare
+   Calendar and Telegram output and verify the ICS subscription and status route.
 
-[Service]
-Type=oneshot
-WorkingDirectory=%h/knue-event-harvester
-ExecStart=/usr/bin/bash %h/knue-event-harvester/run.sh
-```
-
-`~/.config/systemd/user/knue-harvester.timer`:
-
-```ini
-[Unit]
-Description=Run KNUE Event Harvester every 15 minutes
-
-[Timer]
-OnBootSec=2min
-OnUnitActiveSec=15min
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-```
-
-Enable: `systemctl --user daemon-reload && systemctl --user enable --now knue-harvester.timer`.
-Logs: `journalctl --user -u knue-harvester.service -f`.
-To survive logout, run `loginctl enable-linger $USER` once.
-
-## Seeding state.db for Integration Tests
-
-The database schema is auto-initialised on first run. To create an empty database manually, run the app once with `DRY_RUN=1` if that flag is supported, or just run `node dist/index.js` — it will create `data/state.db` with the correct schema and exit after the first cycle.
-
-Alternatively, import and call `initDatabase()` from `src/lib/state.ts` directly in a test setup fixture.
-
-## Sweep
-
-Sweep script: `bash tools/sweep.sh`
-
-**Trigger:** SessionStart hook fires automatically if `tools/.sweep-stamp` is older than 7 days. Also runnable manually at any time.
-
-The sweep checks:
-1. Lint (`tsc --noEmit`) — must pass
-2. Test coverage — must meet 80/80/75 thresholds
-3. Doc drift — README must not contain `Wrangler`, `OPENAI_API_KEY`, or `KV` (stale Cloudflare text)
-4. Golden-principle violations — no `DROP COLUMN`/`DROP TABLE`/`RENAME COLUMN` in `src/lib/state.ts`; no secret keys logged to console
-5. Harness freshness — AGENTS.md line count, `.agents/skills` symlink target
-
-## Environment Variables
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `OLLAMA_HOST` | No | `http://127.0.0.1:11434` | Ollama server URL |
-| `OLLAMA_CONTENT_MODEL` | Yes | — | Model for content summarisation (e.g. `llama3.1:8b`) |
-| `OLLAMA_VISION_MODEL` | No | — | Vision model for OCR; leave empty to skip OCR |
-| `DATABASE_PATH` | No | `./data/state.db` | SQLite state database path |
-| `SIMILARITY_THRESHOLD` | No | `0.85` | Cosine similarity threshold for dedup |
-| `LOOKBACK_DAYS` | No | `30` | How far back to check for duplicate Calendar events |
-| `GOOGLE_CALENDAR_ID` | Yes | — | Target Google Calendar ID |
-| `GOOGLE_SERVICE_ACCOUNT_JSON` | Yes | — | Full service account JSON (single line, escaped) |
-| `TELEGRAM_BOT_TOKEN` | No | — | Telegram bot token; skip Telegram if absent |
-| `TELEGRAM_USER_ID` | No | — | Telegram user/chat ID for notifications |
-
-## Common Failure Modes
-
-| Symptom | Likely cause | Fix |
-|---------|-------------|-----|
-| `Error: connect ECONNREFUSED 127.0.0.1:11434` | Ollama not running | `ollama serve` |
-| `JWT sign failed` or `401 Unauthorized` on Calendar | Service account JSON malformed or missing calendar permissions | Re-export JSON (ensure `private_key` is unescaped), share calendar with service account email |
-| Telegram: `400 Bad Request` | Invalid `TELEGRAM_USER_ID` format | Use numeric user ID, not username |
-| Telegram: `429 Too Many Requests` | Rate limited | Notifications are fail-open — logged but not retried |
-| `SQLITE_CANTOPEN` | `data/` directory does not exist | `mkdir -p data` |
-| Duplicate Calendar events | Concurrent `run.sh` invocations | Add `flock` to cron (see above) |
-| Coverage below threshold | New code in `src/lib/**` without tests | Write tests; `npm run test:coverage` shows uncovered lines |
-| `test/lib/state.test.ts` fails with `bindings.js` / `Cannot read properties of undefined (reading 'close')` | `better-sqlite3` native binding missing/mismatched for this Node/arch | `npm rebuild better-sqlite3` (or reinstall `node_modules`) |
+For rollback, disable the new Worker schedule and wait for any current execution.
+Reconcile Calendar events and processed state before restarting the legacy cron.
+A code rollback leaves Durable Object state and already created calendar events
+in place.
