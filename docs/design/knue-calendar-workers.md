@@ -2,14 +2,14 @@
 
 ## Problem Statement
 
-The official academic-calendar feed runs as a Cloudflare Worker. The bulletin harvester
-needs a server with Node.js, cron, Ollama, and SQLite. Maintaining them together should
+Before the migration, the official academic-calendar feed ran as a Cloudflare Worker.
+The bulletin harvester used a server with Node.js, cron, Ollama, and SQLite. Maintaining them together should
 preserve existing calendar subscriptions, prevent duplicate events, and remove the
 harvester's dependency on the server.
 
 ## Solution
 
-Maintain both TypeScript apps in one repository, proposed as `knue-calendar-tools`,
+Maintain both TypeScript apps in `knue-calendar-tools`,
 with independent Worker configuration and deployment. Run the harvester on a
 Cloudflare Cron Trigger, call OpenAI Chat Completions through Cloudflare AI Gateway,
 and keep harvest state in Durable Object key-value storage.
@@ -38,8 +38,9 @@ and keep harvest state in Durable Object key-value storage.
   details.
 - Use one Durable Object per harvester job. Its strongly consistent key-value API
   stores one record per processed post, one watermark per feed, and the item failure
-  counters. Cloudflare manages the storage backend. Export records from the production
-  SQLite snapshot once and make the import repeatable, including legacy keys.
+  counters. Cloudflare manages the storage backend. Keep the repeatable snapshot
+  importer and legacy-key support available for staging and recovery. Production
+  started at the `bbs28` watermark `84558` with empty record and failure lists.
 - Replace the filesystem lock with an atomic, expiring lease in the Durable Object.
   Acquire and update the lease in short storage operations and run network I/O in the
   scheduled Worker. Use stable Google Calendar event identifiers for new inserts and
@@ -48,10 +49,10 @@ and keep harvest state in Durable Object key-value storage.
 - Bound work and API timeouts per invocation. Defer unfinished items to a later run
   without advancing the source watermark past them.
 - First validate the harvester in a staging Worker with isolated state and output.
-  At cutover, stop the old cron and wait for its last run to finish, take and verify
-  the final SQLite snapshot, then enable the Cloudflare schedule. If rollback is
-  needed, disable the Worker trigger and reconcile state and events before starting
-  the old cron again.
+  At cutover, production was initialized from the last processed bulletin ID, and
+  the Cloudflare schedule was enabled at 15-minute intervals. If rollback is needed,
+  disable the Worker trigger and reconcile state and events before starting the old
+  cron again.
 
 ## Alternatives rejected
 
@@ -88,8 +89,8 @@ and keep harvest state in Durable Object key-value storage.
 
 - The harvester previously ran on Cloudflare and used OpenAI.
   [Migration away from Cloudflare and OpenAI](https://github.com/kadragon/knue-event-harvester/pull/62)
-- Confirm the production Cloudflare account, API model access, and latest SQLite
-  snapshot before changing the live schedule.
+- See the [harvester runbook](../../apps/event-harvester/docs/runbook.md) for
+  state initialization and schedule checks.
 - References for the new interfaces.
   [Cron Triggers](https://developers.cloudflare.com/workers/configuration/cron-triggers/)
   [AI Gateway OpenAI provider](https://developers.cloudflare.com/ai-gateway/usage/providers/openai/)
