@@ -55,6 +55,7 @@ const MAX_HARVEST_MS = 8 * 60_000;
 const MAX_ITEMS_PER_RUN = 20;
 const MAX_PENDING_RETRIES_PER_FEED = 5;
 const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
+const KNUE_USER_AGENT = "knue-event-harvester/1.0";
 
 interface HarvestBudget {
   remaining: number;
@@ -78,7 +79,7 @@ function buildCalendarEventUrl(eventId: string, calendarId: string): string {
 
 async function fetchRssFeed(url: string): Promise<string> {
   const response = await fetch(url, {
-    headers: { "User-Agent": "knue-event-harvester/1.0" },
+    headers: { "User-Agent": KNUE_USER_AGENT },
     signal: AbortSignal.timeout(15_000),
   });
   if (!response.ok) throw new Error(`RSS fetch failed: ${response.status}`);
@@ -103,6 +104,7 @@ async function fetchImageAsBase64(url: string): Promise<PreviewContent | null> {
     return null;
   }
   const response = await fetch(source, {
+    headers: { "User-Agent": KNUE_USER_AGENT },
     redirect: "manual",
     signal: AbortSignal.timeout(15_000),
   });

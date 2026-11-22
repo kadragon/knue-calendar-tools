@@ -76,6 +76,9 @@ describe("harvester Worker", () => {
           );
         }
         if (url.href === "https://www.knue.ac.kr/poster.png") {
+          if (request.headers.get("User-Agent") !== "knue-event-harvester/1.0") {
+            return new Response(null, { status: 500 });
+          }
           return new Response(new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]), {
             headers: { "Content-Type": "application/x-msdownload" },
           });
