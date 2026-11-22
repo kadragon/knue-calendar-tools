@@ -1,0 +1,283 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { getEventsFromSite } from "../src/parser";
+import { mockHtmlResponse } from "./helpers/mocks";
+
+const fetchMock = vi.fn<typeof fetch>();
+
+beforeEach(() => {
+	vi.restoreAllMocks();
+	fetchMock.mockReset();
+	vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
+});
+
+afterEach(() => {
+	vi.unstubAllGlobals();
+});
+
+describe("Parser", () => {
+	it("should parse events from HTML response", async () => {
+		fetchMock.mockResolvedValue(new Response(mockHtmlResponse));
+
+		const events = await getEventsFromSite(2024);
+
+		expect(events).toHaveLength(2); // Should filter out holidays and 수업보강
+		expect(events[0].title).toBe("개강일");
+		expect(events[1].title).toBe("중간고사");
+	});
+
+	it("should filter out holidays", async () => {
+		const htmlWithHoliday = `
+      <table>
+        <tbody>
+          <tr>
+            <td>05 . 05</td>
+            <td><a href="#">어린이날</a></td>
+          </tr>
+          <tr>
+            <td>05 . 10</td>
+            <td><a href="#">정상 이벤트</a></td>
+          </tr>
+        </tbody>
+      </table>
+    `;
+
+		fetchMock.mockResolvedValue(new Response(htmlWithHoliday));
+
+		const events = await getEventsFromSite(2024);
+
+		expect(events).toHaveLength(1);
+		expect(events[0].title).toBe("정상 이벤트");
+	});
+
+	it("should filter out 수업보강 events", async () => {
+		const htmlWithMakeup = `
+      <table>
+        <tbody>
+          <tr>
+            <td>04 . 01</td>
+            <td><a href="#">수업보강</a></td>
+          </tr>
+          <tr>
+            <td>04 . 02</td>
+            <td><a href="#">정상 이벤트</a></td>
+          </tr>
+        </tbody>
+      </table>
+    `;
+
+		fetchMock.mockResolvedValue(new Response(htmlWithMakeup));
+
+		const events = await getEventsFromSite(2024);
+
+		expect(events).toHaveLength(1);
+		expect(events[0].title).toBe("정상 이벤트");
+	});
+
+	it("should handle events with end dates", async () => {
+		fetchMock.mockResolvedValue(new Response(mockHtmlResponse));
+
+		const events = await getEventsFromSite(2024);
+		const midtermEvent = events.find((e) => e.title === "중간고사");
+
+		expect(midtermEvent).toBeDefined();
+		expect(midtermEvent?.start).toEqual(new Date("2024-05-15"));
+		expect(midtermEvent?.end).toEqual(new Date("2024-05-17"));
+	});
+
+	it("should handle events without end dates", async () => {
+		fetchMock.mockResolvedValue(new Response(mockHtmlResponse));
+
+		const events = await getEventsFromSite(2024);
+		const startEvent = events.find((e) => e.title === "개강일");
+
+		expect(startEvent).toBeDefined();
+		expect(startEvent?.start).toEqual(new Date("2024-03-01"));
+		expect(startEvent?.end).toEqual(new Date("2024-03-01"));
+	});
+
+	it("should handle cross-year academic calendar", async () => {
+		const htmlCrossYear = `
+      <table>
+        <tbody>
+          <tr>
+            <td>01 . 15 - 02 . 28</td>
+            <td><a href="#">겨울방학</a></td>
+          </tr>
+          <tr>
+            <td>03 . 01</td>
+            <td><a href="#">개강일</a></td>
+          </tr>
+        </tbody>
+      </table>
+    `;
+
+		fetchMock.mockResolvedValue(new Response(htmlCrossYear));
+
+		const events = await getEventsFromSite(2024);
+
+		// Winter break should be in 2025 (next year for academic calendar)
+		const winterBreak = events.find((e) => e.title === "겨울방학");
+		expect(winterBreak?.start.getFullYear()).toBe(2025);
+
+		// Spring semester start should be in 2024
+		const springStart = events.find((e) => e.title === "개강일");
+		expect(springStart?.start.getFullYear()).toBe(2024);
+	});
+
+	it("should return empty array on network error", async () => {
+		fetchMock.mockRejectedValue(new Error("Network error"));
+
+		const events = await getEventsFromSite(2024);
+
+		expect(events).toEqual([]);
+		expect(fetchMock).toHaveBeenCalledTimes(1); // Should be called once, no retry
+	});
+
+	it("should skip events with missing start date", async () => {
+		const htmlMissingDate = `
+      <table>
+        <tbody>
+          <tr>
+            <td></td>
+            <td><a href="#">이벤트 무효</a></td>
+          </tr>
+          <tr>
+            <td>03 . 01</td>
+            <td><a href="#">정상 이벤트</a></td>
+          </tr>
+        </tbody>
+      </table>
+    `;
+
+		fetchMock.mockResolvedValue(new Response(htmlMissingDate));
+
+		const events = await getEventsFromSite(2024);
+
+		expect(events).toHaveLength(1);
+		expect(events[0].title).toBe("정상 이벤트");
+	});
+
+	it("should handle malformed HTML gracefully", async () => {
+		const malformedHtml = "<div>Not a table</div>";
+
+		fetchMock.mockResolvedValue(new Response(malformedHtml));
+
+		const events = await getEventsFromSite(2024);
+
+		expect(events).toEqual([]);
+	});
+
+	it("should handle events with missing title gracefully", async () => {
+		const htmlMissingTitle = `
+      <table>
+        <tbody>
+          <tr>
+            <td>03 . 01</td>
+            <td><a href="#"></a></td>
+          </tr>
+        </tbody>
+      </table>
+    `;
+
+		fetchMock.mockResolvedValue(new Response(htmlMissingTitle));
+
+		const events = await getEventsFromSite(2024);
+
+		expect(events).toHaveLength(0);
+	});
+
+	it("should truncate long titles", async () => {
+		const longTitle = "A".repeat(50); // Longer than 45 chars
+		const htmlLongTitle = `
+      <table>
+        <tbody>
+          <tr>
+            <td>03 . 01</td>
+            <td><a href="#">${longTitle}</a></td>
+          </tr>
+        </tbody>
+      </table>
+    `;
+
+		fetchMock.mockResolvedValue(new Response(htmlLongTitle));
+
+		const events = await getEventsFromSite(2024);
+
+		expect(events).toHaveLength(1);
+		expect(events[0].title).toBe(`${longTitle.substring(0, 42)}...`);
+	});
+
+	it("should handle events with missing start date gracefully", async () => {
+		const htmlMissingStart = `
+      <table>
+        <tbody>
+          <tr>
+            <td></td>
+            <td><a href="#">이벤트</a></td>
+          </tr>
+        </tbody>
+      </table>
+    `;
+
+		fetchMock.mockResolvedValue(new Response(htmlMissingStart));
+
+		const events = await getEventsFromSite(2024);
+
+		expect(events).toHaveLength(0);
+	});
+
+	it("should handle events with missing end date gracefully", async () => {
+		const htmlMissingEnd = `
+      <table>
+        <tbody>
+          <tr>
+            <td>03 . 01</td>
+            <td><a href="#">이벤트</a></td>
+          </tr>
+        </tbody>
+      </table>
+    `;
+
+		fetchMock.mockResolvedValue(new Response(htmlMissingEnd));
+
+		const events = await getEventsFromSite(2024);
+
+		expect(events).toHaveLength(1);
+		expect(events[0].title).toBe("이벤트");
+		expect(events[0].start).toEqual(new Date("2024-03-01"));
+		expect(events[0].end).toEqual(new Date("2024-03-01"));
+	});
+
+	it("should handle non-Error network exceptions", async () => {
+		fetchMock.mockRejectedValue("String network error");
+
+		const events = await getEventsFromSite(2024);
+
+		expect(events).toEqual([]);
+	});
+
+	it("should extract title when extra markup (badges, icons) exists", async () => {
+		const htmlWithBadge = `
+      <table>
+        <tbody>
+          <tr>
+            <td>03 . 01</td>
+            <td><a href="#">중간고사</a><span class="tag-new"></span></td>
+          </tr>
+          <tr>
+            <td>03 . 02</td>
+            <td><a href="#">개강일</a><i class="icon-important"></i><em></em></td>
+          </tr>
+        </tbody>
+      </table>
+    `;
+
+		fetchMock.mockResolvedValue(new Response(htmlWithBadge));
+
+		const events = await getEventsFromSite(2024);
+
+		expect(events).toHaveLength(2);
+		expect(events[0].title).toBe("중간고사");
+		expect(events[1].title).toBe("개강일");
+	});
+});

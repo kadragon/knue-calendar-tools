@@ -1,0 +1,20 @@
+completed_tasks:
+  - id: TASK-on-demand-1
+    title: "Implement on-demand ICS generation with 24-hour caching"
+    spec_id: SPEC-on-demand-ics-generation-1
+    completed_at: "2025-12-18T08:00:00Z"
+    summary: |
+      Successfully migrated from scheduled cron-based generation to on-demand generation.
+
+      Changes:
+      - Removed `scheduled()` handler and `[triggers]` cron from wrangler.toml
+      - Added `isCacheValid()` to check if KCS is within 24 hours
+      - Added `generateAndSaveIcs()` to fetch events and save to KV
+      - Updated fetch handler: check HTTP cache → check KV cache age → generate on-demand or use stale cache as fallback
+      - Updated CACHE_CONFIG with kvTtl constant
+
+      Testing:
+      - All 61 tests passing
+      - New test suite for on-demand cache behavior
+      - Graceful fallback to stale cache if generation fails
+      - 503 error only when cache missing and generation fails

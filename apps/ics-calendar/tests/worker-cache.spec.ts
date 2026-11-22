@@ -1,0 +1,117 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { CACHE_KEY } from "../src/constants";
+import worker from "../src/index";
+import type { Env } from "../src/types";
+import {
+	createMockExecutionContext,
+	createMockRequest,
+	installMockCaches,
+	MockKVNamespace,
+} from "./helpers/mocks";
+
+vi.mock("../src/parser", () => ({
+	getEventsFromSite: vi.fn().mockResolvedValue([
+		{
+			start: new Date("2024-03-01"),
+			end: new Date("2024-03-01"),
+			title: "개강일",
+		},
+	]),
+}));
+
+vi.mock("../src/utils/academic-year", () => ({
+	getAcademicYearsToFetch: vi.fn().mockReturnValue([2024, 2023]),
+}));
+
+describe("Worker Cache Integration", () => {
+	let kv: MockKVNamespace;
+	let env: Env;
+	let ctx: ExecutionContext;
+	let cacheRestore: { restore(): void };
+
+	beforeEach(() => {
+		kv = new MockKVNamespace();
+		env = { KNUE_CAL_KV: kv as unknown as KVNamespace };
+		ctx = createMockExecutionContext();
+
+		cacheRestore = installMockCaches();
+		vi.clearAllMocks();
+	});
+
+	afterEach(() => {
+		cacheRestore.restore();
+	});
+
+	it("serves ICS from cache when entry is warmed", async () => {
+		const icsContent = "BEGIN:VCALENDAR\nEND:VCALENDAR";
+		const cacheResponse = new Response(icsContent, {
+			headers: {
+				"content-type": "text/calendar; charset=utf-8",
+				"cache-control": "public, max-age=86400",
+				etag: '"abc123"',
+				"last-modified": new Date().toUTCString(),
+			},
+		});
+
+		await caches.default.put(new Request(CACHE_KEY), cacheResponse);
+
+		const request = createMockRequest("https://example.com/events.ics");
+		const response = await worker.fetch(request, env, ctx);
+
+		expect(response.status).toBe(200);
+		expect(await response.text()).toBe(icsContent);
+	});
+
+	it("backfills cache from KV when cache miss occurs", async () => {
+		const icsContent = "BEGIN:VCALENDAR\nEND:VCALENDAR";
+		const updatedAt = new Date().toISOString();
+		await kv.put("latest", icsContent, {
+			metadata: {
+				updatedAt,
+				etag: '"test-etag"',
+			},
+		});
+
+		const request = createMockRequest("https://example.com/events.ics");
+		const response = await worker.fetch(request, env, ctx);
+
+		expect(response.status).toBe(200);
+		expect(await response.text()).toBe(icsContent);
+		expect(response.headers.get("last-modified")).toBe(
+			new Date(updatedAt).toUTCString(),
+		);
+
+		const warmed = await caches.default.match(new Request(CACHE_KEY));
+		expect(warmed).toBeDefined();
+	});
+
+	it("warms cache after on-demand generation", async () => {
+		// Trigger on-demand ICS generation by requesting when cache is empty
+		const request = createMockRequest("https://example.com/events.ics");
+		const response = await worker.fetch(request, env, ctx);
+
+		expect(response.status).toBe(200);
+
+		// Verify HTTP cache was warmed
+		const cached = await caches.default.match(new Request(CACHE_KEY));
+		expect(cached).toBeDefined();
+	});
+
+	it("handles missing metadata gracefully with fallback", async () => {
+		const icsContent = "BEGIN:VCALENDAR\nEND:VCALENDAR";
+		// Simulate legacy data without metadata - should trigger regeneration
+		await kv.put("latest", icsContent);
+
+		const request = createMockRequest("https://example.com/events.ics");
+		const response = await worker.fetch(request, env, ctx);
+
+		expect(response.status).toBe(200);
+		// Should regenerate since metadata is missing
+		const responseText = await response.text();
+		expect(responseText).toContain("BEGIN:VCALENDAR");
+		expect(responseText).toContain("개강일");
+		// Should have Last-Modified and etag headers
+		expect(response.headers.get("last-modified")).toBeDefined();
+		expect(response.headers.get("etag")).toBeDefined();
+	});
+});
